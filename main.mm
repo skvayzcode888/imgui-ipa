@@ -19,11 +19,12 @@ static float g_value     = 1.0f;
  
 static void DrawMenu()
 {
-    ImGui::SetNextWindowSize(ImVec2(360, 260), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 220), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(40, 60), ImGuiCond_FirstUseEver);
-    ImGui::Begin("MyMenu");
+    ImGui::Begin("crown.pw");
  
     ImGui::Text("Hello from ImGui %s", ImGui::GetVersion());
+    ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
     ImGui::Checkbox("Feature A", &g_featureA);
     ImGui::SliderFloat("Value", &g_value, 0.0f, 10.0f);
@@ -85,8 +86,8 @@ static void DrawMenu()
     io.IniFilename = nullptr;           // не писать imgui.ini
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(1.8f);
-    io.FontGlobalScale = 1.8f;          // на телефоне шрифт иначе крошечный
+    ImGui::GetStyle().ScaleAllSizes(1.2f);  // размер отступов/виджетов
+    io.FontGlobalScale = 1.2f;              // размер шрифта (меняется слайдером в меню)
  
     ImGui_ImplMetal_Init(_device);
     return self;
