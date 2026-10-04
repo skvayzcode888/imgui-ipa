@@ -22,8 +22,14 @@ jobs:
       - name: Build
         run: make FINALPACKAGE=1
 
+      - name: Show build output
+        run: find .theos -name "*.dylib"
+
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: libMyMenu
-          path: .theos/obj/libMyMenu.dylib
+          name: MyMenu-dylib
+          path: |
+            .theos/obj/MyMenu.dylib
+            .theos/obj/debug/MyMenu.dylib
+          if-no-files-found: error
