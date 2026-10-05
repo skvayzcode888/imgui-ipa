@@ -19,11 +19,14 @@
 // ============================================================
 //  OFFSETS  (IDA Pro, pool 56.29.2, base 0x100000000)
 //
-//  Global ptr to AutoAim obj : 0x104ECB0
-//    -> file offset           : 0x104ECB0 - 0x100000000 = 0x4ECB0
+//  AutoAim — статический объект (не pointer!), живёт в BSS:
+//    IDA addr  : 0x104ECB0
+//    file offset: 0x104ECB0 - 0x100000000 = 0x4ECB0
+//    runtime   : image_base + 0x4ECB0  <- это сам объект
 //
-//  AutoAim + 0x78  -> GameManager*
-//  AutoAim + 0x88  -> GameManager* (fallback)
+//  AutoAim (объект):
+//    +0x78  -> GameManager*
+//    +0x88  -> GameManager* (fallback)
 //
 //  GameManager:
 //    +0x400 -> Table*
@@ -39,10 +42,11 @@
 //
 //  Ball   : +0xA4 -> state (0=active, 1=pocketed)
 //  Button : +0x08 -> world X,  +0x0C -> world Y
-//  VisualCue: +0x18 -> X, +0x1C -> Y
+//  VisualCue: +0x18 -> X,  +0x1C -> Y
 // ============================================================
 
-static const uintptr_t kAutoAimFileOffset = 0x4ECB0; // IDA addr - 0x100000000
+// Объект AutoAim живёт прямо по этому смещению в бинаре (не pointer!)
+static const uintptr_t kAutoAimFileOffset = 0x4ECB0;
 
 // ============================================================
 //  BASE ADDRESS  (через mach_header, не vmaddr_slide)
@@ -131,12 +135,12 @@ static GameState ReadGameState()
         return s;
     }
 
-    // AutoAim ptr хранится в .data секции по file offset kAutoAimFileOffset
-    uintptr_t ptrAddr = base + kAutoAimFileOffset;
-    uintptr_t aa      = SafeRead<uintptr_t>(ptrAddr);
+    // AutoAim — статический объект, живёт прямо по этому адресу
+    uintptr_t aa = base + kAutoAimFileOffset;
     s.dbgAA = aa;
+    // Проверяем что адрес читаем (BSS должен быть замапан)
     if (!IsPtr(aa)) {
-        snprintf(s.err, sizeof(s.err), "AutoAim=0 @ 0x%llX", (unsigned long long)ptrAddr);
+        snprintf(s.err, sizeof(s.err), "aa addr invalid: 0x%llX", (unsigned long long)aa);
         return s;
     }
 
@@ -260,7 +264,6 @@ static void DrawMenu()
             ImGui::Text("err: %s", gs.err);
             ImGui::Separator();
             ImGui::Text("base    0x%llX", (unsigned long long)gs.dbgBase);
-            ImGui::Text("ptrAddr 0x%llX", (unsigned long long)(gs.dbgBase + kAutoAimFileOffset));
             ImGui::Text("autoAim 0x%llX", (unsigned long long)gs.dbgAA);
             ImGui::Text("gameMgr 0x%llX", (unsigned long long)gs.dbgGM);
             ImGui::Text("table   0x%llX", (unsigned long long)gs.dbgTbl);
