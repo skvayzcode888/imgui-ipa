@@ -69,20 +69,62 @@ static bool IsPtr(uintptr_t p)
 //  ASLR
 // ============================================================
 
-static uintptr_t g_slide = 0;
+static uintptr_t g_slide     = 0;
+static int       g_slideIdx  = -1;  // индекс найденного образа
+static char      g_imageName[256] = {};
+
+// Ключевые слова в имени главного бинаря игры (пробуем по порядку)
+static const char *kGameNames[] = {
+    "8 Ball Pool",
+    "8BallPool",
+    "miniclip",
+    "pool",
+    nullptr
+};
 
 static uintptr_t GetSlide()
 {
     if (g_slide) return g_slide;
+
     uint32_t cnt = _dyld_image_count();
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, "/pool")) {
-            g_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            return g_slide;
+
+    // Сначала ищем по ключевым словам (без учёта регистра не нужно — пути в iOS lowercase)
+    for (int k = 0; kGameNames[k]; k++) {
+        for (uint32_t i = 0; i < cnt; i++) {
+            const char *n = _dyld_get_image_name(i);
+            if (!n) continue;
+            if (strstr(n, kGameNames[k])) {
+                g_slide    = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+                g_slideIdx = (int)i;
+                strncpy(g_imageName, n, sizeof(g_imageName)-1);
+                return g_slide;
+            }
         }
     }
-    g_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+
+    // Fallback: образ с наибольшим размером текст-сегмента — это обычно главный бинарь
+    // Берём образ у которого slide НЕ равен слайду нашего dylib'а
+    // (наш dylib — первый в списке или последний, главный бинарь — обычно индекс 0)
+    uintptr_t mySlide = (uintptr_t)_dyld_get_image_vmaddr_slide(
+        _dyld_image_count() - 1);  // наш dylib последний
+
+    for (uint32_t i = 0; i < cnt; i++) {
+        uintptr_t sl = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+        if (sl != mySlide) {
+            const char *n = _dyld_get_image_name(i);
+            if (n && strstr(n, ".app/")) {
+                g_slide    = sl;
+                g_slideIdx = (int)i;
+                strncpy(g_imageName, n, sizeof(g_imageName)-1);
+                return g_slide;
+            }
+        }
+    }
+
+    // Последний резерв: индекс 0
+    g_slide    = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    g_slideIdx = 0;
+    strncpy(g_imageName, _dyld_get_image_name(0) ?: "?", sizeof(g_imageName)-1);
     return g_slide;
 }
 
@@ -274,9 +316,26 @@ static void DrawMenu()
             ImGui::Text("err: %s", gs.err);
             ImGui::Separator();
             ImGui::Text("slide   0x%llX", (unsigned long long)gs.dbgSlide);
+            ImGui::Text("image:  %s", g_imageName[0] ? g_imageName : "not found");
             ImGui::Text("autoAim 0x%llX", (unsigned long long)gs.dbgAA);
+            ImGui::Text("ptrAddr 0x%llX", (unsigned long long)(gs.dbgSlide + kAutoAimStatic));
             ImGui::Text("gameMgr 0x%llX", (unsigned long long)gs.dbgGM);
             ImGui::Text("table   0x%llX", (unsigned long long)gs.dbgTbl);
+            ImGui::Separator();
+            // Список всех образов — чтобы найти правильное имя
+            ImGui::TextColored(ImVec4(0.8f,0.8f,0.3f,1), "All images (non-system):");
+            uint32_t cnt = _dyld_image_count();
+            for (uint32_t i = 0; i < cnt; i++) {
+                const char *n = _dyld_get_image_name(i);
+                if (!n) continue;
+                // Пропускаем системные библиотеки
+                if (strncmp(n, "/usr/lib",  8) == 0) continue;
+                if (strncmp(n, "/System",   7) == 0) continue;
+                if (strncmp(n, "/private/prebuilt", 17) == 0) continue;
+                uintptr_t sl = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+                const char *short_n = strrchr(n, '/') ? strrchr(n,'/')+1 : n;
+                ImGui::Text("[%u] 0x%llX  %s", i, (unsigned long long)sl, short_n);
+            }
         } else {
             ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "Lunok: %d", gs.pocketCount);
 
