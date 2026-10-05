@@ -62,7 +62,7 @@ static bool IsReadable(uintptr_t addr, size_t sz)
     if (addr < 0x10000 || addr == (uintptr_t)-1) return false;
     // mincore проверяет resident pages; возвращает 0 если страница доступна
     uintptr_t page = addr & ~(uintptr_t)(getpagesize() - 1);
-    unsigned char vec = 0;
+    char vec = 0;
     return (mincore((void*)page, sz, &vec) == 0);
 }
 
