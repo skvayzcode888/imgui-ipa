@@ -1,5 +1,5 @@
-// Dear ImGui (Metal) overlay for 8 Ball Pool
-// Open/close menu: double-tap with 3 fingers
+// Dear ImGui (Metal) overlay — 8 Ball Pool mod
+// Open/close: 3-finger double-tap
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -13,69 +13,61 @@
 
 #include <stdint.h>
 #include <math.h>
-#include <sys/mman.h>   // mincore
-#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
 
-// ==========================================================================
-//  OFFSETS (IDA Pro, reflection table 0xF04700, binary 8BP 56.29.2)
-// ==========================================================================
-//
-//  AutoAim singleton addr (static, no ASLR): 0x104ECB0
+// ============================================================
+//  OFFSETS (IDA 8BP 56.29.2, reflection table 0xF04700)
+// ============================================================
+//  Global static ptr to AutoAim object: 0x104ECB0
 //    AutoAim + 0x78   -> GameManager*
-//    AutoAim + 0x88   -> GameManager* (fallback, try if 0x78 fails)
-//
+//    AutoAim + 0x88   -> GameManager* (fallback)
 //  GameManager:
-//    +0x400  -> Table*
-//    +0x4D0  -> VisualCue*
-//    +0x720  -> mPocketNominationButtons.begin  (vector<Button*>)
-//    +0x728  -> mPocketNominationButtons.end
-//
+//    +0x400 -> Table*
+//    +0x4D0 -> VisualCue*
+//    +0x720 -> mPocketNominationButtons.begin (vector<Button*>)
+//    +0x728 -> mPocketNominationButtons.end
 //  Table:
-//    +0x468  -> mBalls.begin  (vector<Ball*>)
-//    +0x470  -> mBalls.end
-//    +0x478  -> mTableShape.begin (vector<vec2f>)  -- begin ptr
-//    +0x480  -> mTableShape.end
-//    +0x490  -> mTightTableShape.begin
-//
+//    +0x468 -> mBalls.begin
+//    +0x470 -> mBalls.end
+//    +0x478 -> mTableShape.begin (vector<vec2f>)
+//    +0x480 -> mTableShape.end
 //  Ball:
-//    +0xA0  -> classification (int: 0=cue,1=solid,2=striped,3=eight)
-//    +0xA4  -> state (int: 0=active, 1=pocketed)
-//    +0xA8  -> number (int)
-//    +0x20  -> physics ptr
-//      physics+0x00 -> x (float)
-//      physics+0x04 -> y (float)
-//
-//  Button (PocketNominationButton):
-//    +0x08  -> world pos x (float)
-//    +0x0C  -> world pos y (float)
-//
-//  VisualCue:
-//    +0x18  -> table pos x (float)
-//    +0x1C  -> table pos y (float)
+//    +0xA4  -> state (0=active, 1=pocketed)
+//  Button: +0x08 -> world X, +0x0C -> world Y
+//  VisualCue: +0x18 -> X, +0x1C -> Y
 
-// ==========================================================================
-//  SAFE MEMORY READ  (iOS: проверяем страницу через mincore)
-// ==========================================================================
+static const uintptr_t kAutoAimStatic = 0x104ECB0;
 
-static bool IsReadable(uintptr_t addr, size_t sz)
-{
-    if (addr < 0x10000 || addr == (uintptr_t)-1) return false;
-    // mincore проверяет resident pages; возвращает 0 если страница доступна
-    uintptr_t page = addr & ~(uintptr_t)(getpagesize() - 1);
-    char vec = 0;
-    return (mincore((void*)page, sz, &vec) == 0);
-}
+// ============================================================
+//  SAFE READ — ObjC exception guard, никакого mincore
+// ============================================================
 
 template<typename T>
 static T SafeRead(uintptr_t addr, T def = T{})
 {
-    if (!IsReadable(addr, sizeof(T))) return def;
-    return *(volatile T *)addr;
+    // базовые sanity checks
+    if (addr < 0x100000000ULL || addr == (uintptr_t)-1) return def;
+    // выравнивание
+    if (addr % alignof(T) != 0) return def;
+    T val = def;
+    @try {
+        val = *(volatile T *)addr;
+    } @catch (...) {
+        val = def;
+    }
+    return val;
 }
 
-// ==========================================================================
-//  ASLR SLIDE
-// ==========================================================================
+static bool IsPtr(uintptr_t p)
+{
+    // Валидный userspace arm64 указатель: 0x100000000 .. 0x7FFFFFFFFFFF
+    return (p >= 0x100000000ULL && p <= 0x7FFFFFFFFFFFULL);
+}
+
+// ============================================================
+//  ASLR
+// ============================================================
 
 static uintptr_t g_slide = 0;
 
@@ -84,112 +76,95 @@ static uintptr_t GetSlide()
     if (g_slide) return g_slide;
     uint32_t cnt = _dyld_image_count();
     for (uint32_t i = 0; i < cnt; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "/pool")) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "/pool")) {
             g_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
             return g_slide;
         }
     }
-    // fallback — первый образ
     g_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
     return g_slide;
 }
 
-static const uintptr_t kAutoAimStatic = 0x104ECB0; // из IDA: byte_104ECB0
-
-// ==========================================================================
+// ============================================================
 //  GAME STATE
-// ==========================================================================
+// ============================================================
 
 struct PocketInfo { float x, y; int idx; };
 
 struct GameState {
     bool  valid;
-    char  errMsg[128];
-    // лунки
+    char  err[128];
     int   pocketCount;
     PocketInfo pockets[6];
     int   nearestIdx;
     float nearestDist;
-    // шары
-    int   totalBalls;
-    int   activeBalls;
-    int   pocketedBalls;
-    // кий
+    int   totalBalls, activeBalls, pocketedBalls;
     float cueX, cueY;
-    // debug
-    uintptr_t dbgSlide;
-    uintptr_t dbgAutoAim;
-    uintptr_t dbgGameMgr;
-    uintptr_t dbgTable;
+    uintptr_t dbgSlide, dbgAA, dbgGM, dbgTbl;
 };
 
 static GameState ReadGameState()
 {
     GameState s = {};
-    s.valid       = false;
     s.nearestIdx  = -1;
     s.nearestDist = 1e9f;
 
-    uintptr_t slide = GetSlide();
-    s.dbgSlide = slide;
+    s.dbgSlide = GetSlide();
 
-    // --- 1. AutoAim ptr ---
-    uintptr_t ptrAddr = slide + kAutoAimStatic;
-    uintptr_t autoAim = SafeRead<uintptr_t>(ptrAddr);
-    s.dbgAutoAim = autoAim;
-    if (!autoAim || autoAim == (uintptr_t)-1) {
-        snprintf(s.errMsg, sizeof(s.errMsg), "AutoAim ptr = 0 (addr 0x%llX)", (unsigned long long)ptrAddr);
+    uintptr_t ptrAddr = s.dbgSlide + kAutoAimStatic;
+    uintptr_t aa      = SafeRead<uintptr_t>(ptrAddr);
+    s.dbgAA = aa;
+    if (!IsPtr(aa)) {
+        snprintf(s.err, sizeof(s.err), "AutoAim=0 @ 0x%llX", (unsigned long long)ptrAddr);
         return s;
     }
 
-    // --- 2. GameManager ptr (offset +0x78 из sub_1F1720) ---
-    uintptr_t gameMgr = SafeRead<uintptr_t>(autoAim + 0x78);
-    if (!gameMgr || gameMgr == (uintptr_t)-1) {
-        // пробуем +0x88
-        gameMgr = SafeRead<uintptr_t>(autoAim + 0x88);
-    }
-    s.dbgGameMgr = gameMgr;
-    if (!gameMgr || gameMgr == (uintptr_t)-1) {
-        snprintf(s.errMsg, sizeof(s.errMsg), "GameMgr ptr = 0");
+    uintptr_t gm = SafeRead<uintptr_t>(aa + 0x78);
+    if (!IsPtr(gm)) gm = SafeRead<uintptr_t>(aa + 0x88);
+    s.dbgGM = gm;
+    if (!IsPtr(gm)) {
+        snprintf(s.err, sizeof(s.err), "GameMgr=0");
         return s;
     }
 
-    // --- 3. Table* ---
-    uintptr_t table = SafeRead<uintptr_t>(gameMgr + 0x400);
-    s.dbgTable = table;
-    if (!table || table == (uintptr_t)-1) {
-        snprintf(s.errMsg, sizeof(s.errMsg), "Table ptr = 0");
+    uintptr_t tbl = SafeRead<uintptr_t>(gm + 0x400);
+    s.dbgTbl = tbl;
+    if (!IsPtr(tbl)) {
+        snprintf(s.err, sizeof(s.err), "Table=0");
         return s;
     }
 
-    // --- 4. Лунки через mPocketNominationButtons ---
-    uintptr_t pktBeg = SafeRead<uintptr_t>(gameMgr + 0x720);
-    uintptr_t pktEnd = SafeRead<uintptr_t>(gameMgr + 0x728);
-    if (pktBeg && pktEnd && pktEnd >= pktBeg && (pktEnd - pktBeg) <= 6*8) {
-        int cnt = (int)((pktEnd - pktBeg) / sizeof(uintptr_t));
-        for (int i = 0; i < cnt && i < 6; i++) {
-            uintptr_t btn = SafeRead<uintptr_t>(pktBeg + i * sizeof(uintptr_t));
-            if (!IsReadable(btn, 0x10)) continue;
-            float px = SafeRead<float>(btn + 0x08);
-            float py = SafeRead<float>(btn + 0x0C);
-            // sanity: координаты стола обычно -500..500
-            if (fabsf(px) > 5000.f || fabsf(py) > 5000.f) continue;
-            s.pockets[s.pocketCount++] = { px, py, i };
+    // Лунки через PocketNominationButtons
+    uintptr_t pkBeg = SafeRead<uintptr_t>(gm + 0x720);
+    uintptr_t pkEnd = SafeRead<uintptr_t>(gm + 0x728);
+    if (IsPtr(pkBeg) && IsPtr(pkEnd) && pkEnd >= pkBeg) {
+        uintptr_t diff = pkEnd - pkBeg;
+        if (diff > 0 && diff <= 6 * 8) {
+            int cnt = (int)(diff / sizeof(uintptr_t));
+            for (int i = 0; i < cnt && i < 6; i++) {
+                uintptr_t btn = SafeRead<uintptr_t>(pkBeg + (uintptr_t)i * 8);
+                if (!IsPtr(btn)) continue;
+                float px = SafeRead<float>(btn + 0x08);
+                float py = SafeRead<float>(btn + 0x0C);
+                if (px == 0.f && py == 0.f) continue;
+                if (fabsf(px) > 5000.f || fabsf(py) > 5000.f) continue;
+                s.pockets[s.pocketCount++] = { px, py, i };
+            }
         }
     }
 
-    // --- 5. Fallback: mTableShape (begin = Table+0x478) ---
+    // Fallback: mTableShape
     if (s.pocketCount == 0) {
-        uintptr_t shBeg = SafeRead<uintptr_t>(table + 0x478);
-        uintptr_t shEnd = SafeRead<uintptr_t>(table + 0x480);
-        if (shBeg && shEnd && shEnd > shBeg) {
-            ptrdiff_t pts = (shEnd - shBeg) / 8;
+        uintptr_t shBeg = SafeRead<uintptr_t>(tbl + 0x478);
+        uintptr_t shEnd = SafeRead<uintptr_t>(tbl + 0x480);
+        if (IsPtr(shBeg) && IsPtr(shEnd) && shEnd > shBeg) {
+            uintptr_t diff = shEnd - shBeg;
+            ptrdiff_t pts = (ptrdiff_t)(diff / 8);
             if (pts >= 6 && pts <= 10000) {
                 int step = (int)(pts / 6);
                 for (int i = 0; i < 6; i++) {
                     uintptr_t pt = shBeg + (uintptr_t)(i * step * 8);
-                    if (!IsReadable(pt, 8)) continue;
                     float px = SafeRead<float>(pt);
                     float py = SafeRead<float>(pt + 4);
                     if (fabsf(px) > 5000.f || fabsf(py) > 5000.f) continue;
@@ -199,31 +174,31 @@ static GameState ReadGameState()
         }
     }
 
-    // --- 6. Шары (Table+0x468) ---
-    uintptr_t ballBeg = SafeRead<uintptr_t>(table + 0x468);
-    uintptr_t ballEnd = SafeRead<uintptr_t>(table + 0x470);
-    if (ballBeg && ballEnd && ballEnd >= ballBeg) {
-        ptrdiff_t cnt = (ballEnd - ballBeg) / sizeof(uintptr_t);
-        if (cnt > 0 && cnt <= 16) {
-            s.totalBalls = (int)cnt;
-            for (int i = 0; i < (int)cnt; i++) {
-                uintptr_t ball = SafeRead<uintptr_t>(ballBeg + i * sizeof(uintptr_t));
-                if (!IsReadable(ball, 0xB0)) continue;
-                int state = SafeRead<int>(ball + 0xA4);
-                if (state == 1) s.pocketedBalls++;
-                else            s.activeBalls++;
+    // Шары
+    uintptr_t bbeg = SafeRead<uintptr_t>(tbl + 0x468);
+    uintptr_t bend = SafeRead<uintptr_t>(tbl + 0x470);
+    if (IsPtr(bbeg) && IsPtr(bend) && bend >= bbeg) {
+        uintptr_t diff = bend - bbeg;
+        if (diff <= 16 * 8) {
+            int cnt = (int)(diff / 8);
+            s.totalBalls = cnt;
+            for (int i = 0; i < cnt; i++) {
+                uintptr_t ball = SafeRead<uintptr_t>(bbeg + (uintptr_t)i * 8);
+                if (!IsPtr(ball)) continue;
+                int st = SafeRead<int>(ball + 0xA4);
+                if (st == 1) s.pocketedBalls++; else s.activeBalls++;
             }
         }
     }
 
-    // --- 7. Позиция кия (VisualCue) ---
-    uintptr_t vcue = SafeRead<uintptr_t>(gameMgr + 0x4D0);
-    if (IsReadable(vcue, 0x20)) {
-        s.cueX = SafeRead<float>(vcue + 0x18);
-        s.cueY = SafeRead<float>(vcue + 0x1C);
+    // Кий
+    uintptr_t vc = SafeRead<uintptr_t>(gm + 0x4D0);
+    if (IsPtr(vc)) {
+        s.cueX = SafeRead<float>(vc + 0x18);
+        s.cueY = SafeRead<float>(vc + 0x1C);
     }
 
-    // --- 8. Ближайшая лунка ---
+    // Ближайшая лунка
     for (int i = 0; i < s.pocketCount; i++) {
         float dx = s.pockets[i].x - s.cueX;
         float dy = s.pockets[i].y - s.cueY;
@@ -235,118 +210,105 @@ static GameState ReadGameState()
     return s;
 }
 
-// ==========================================================================
-//  РУССКИЙ ШРИФТ — грузим системный .ttf с устройства
-//  (Arial/PingFang есть на всех iOS, поддерживают кириллицу)
-// ==========================================================================
+// ============================================================
+//  FONT — грузим Arial с кириллицей, только если файл есть
+// ============================================================
 
-static bool LoadCyrillicFont(float size_px)
+static void LoadFont(float sz)
 {
-    // Пути к шрифтам с кириллицей на iOS
+    ImGuiIO &io = ImGui::GetIO();
+
     const char *paths[] = {
         "/System/Library/Fonts/Cache/ArialMT.ttf",
         "/System/Library/Fonts/ArialMT.ttf",
         "/System/Library/Fonts/Core/ArialMT.ttf",
-        "/System/Library/Fonts/LanguageSupport/Helvetica.dfont",
-        "/System/Library/Fonts/Helvetica.ttc",
         nullptr
     };
 
-    ImGuiIO &io = ImGui::GetIO();
-
-    // Диапазоны: ASCII + кириллица
     static ImVector<ImWchar> ranges;
-    ImFontGlyphRangesBuilder builder;
-    builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-    builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
-    builder.BuildRanges(&ranges);
-
-    for (int i = 0; paths[i]; i++) {
-        ImFont *f = io.Fonts->AddFontFromFileTTF(paths[i], size_px, nullptr, ranges.Data);
-        if (f) return true;
+    if (ranges.empty()) {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        b.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+        b.BuildRanges(&ranges);
     }
 
-    // Последний резерв: встроенный шрифт ImGui (ASCII only, хотя бы не крашнется)
+    for (int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "rb");
+        if (!f) continue;
+        fclose(f);
+        if (io.Fonts->AddFontFromFileTTF(paths[i], sz, nullptr, ranges.Data))
+            return;
+    }
+    // fallback — ASCII
     io.Fonts->AddFontDefault();
-    return false;
 }
 
-// ==========================================================================
-//  МЕНЮ
-// ==========================================================================
+// ============================================================
+//  MENU
+// ============================================================
 
 static bool g_showPockets = false;
 static bool g_demoWindow  = false;
 
 static void DrawMenu()
 {
-    ImGui::SetNextWindowSize(ImVec2(340, 380), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340, 400), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos (ImVec2(40,  60),  ImGuiCond_FirstUseEver);
     ImGui::Begin("crown.pw");
 
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
 
-    ImGui::Checkbox("Info: luzы / шары", &g_showPockets);
+    ImGui::Checkbox("Lunki / Shary", &g_showPockets);
 
     if (g_showPockets) {
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.13f, 0.95f));
-        // высота 0 = авто до конца окна
-        ImGui::BeginChild("##pk", ImVec2(0, 0), true);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f,0.08f,0.13f,0.95f));
+        ImGui::BeginChild("##pk", ImVec2(0,0), true);
 
         GameState gs = ReadGameState();
 
         if (!gs.valid) {
-            ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "Igra ne aktivna");
-            ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "err: %s", gs.errMsg);
+            ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "Igra ne aktivna");
+            ImGui::Text("err: %s", gs.err);
             ImGui::Separator();
-            ImGui::Text("slide    0x%llX", (unsigned long long)gs.dbgSlide);
-            ImGui::Text("autoAim  0x%llX", (unsigned long long)gs.dbgAutoAim);
-            ImGui::Text("gameMgr  0x%llX", (unsigned long long)gs.dbgGameMgr);
-            ImGui::Text("table    0x%llX", (unsigned long long)gs.dbgTable);
+            ImGui::Text("slide   0x%llX", (unsigned long long)gs.dbgSlide);
+            ImGui::Text("autoAim 0x%llX", (unsigned long long)gs.dbgAA);
+            ImGui::Text("gameMgr 0x%llX", (unsigned long long)gs.dbgGM);
+            ImGui::Text("table   0x%llX", (unsigned long long)gs.dbgTbl);
         } else {
-            // --- Лунки ---
-            ImGui::TextColored(ImVec4(0.4f,1,0.4f,1),
-                "Lunok vsego: %d", gs.pocketCount);
+            ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "Lunok: %d", gs.pocketCount);
 
             if (gs.nearestIdx >= 0) {
                 ImGui::TextColored(ImVec4(1,1,0.3f,1),
-                    "Blizhayshaya: #%d  dist=%.1f",
+                    "Blizhayshaya #%d  dist=%.1f",
                     gs.nearestIdx, gs.nearestDist);
                 ImGui::Text("  X=%.2f  Y=%.2f",
                     gs.pockets[gs.nearestIdx].x,
                     gs.pockets[gs.nearestIdx].y);
             } else {
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1), "Net dannykh po luzam");
+                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1), "Luzy: net dannykh");
             }
 
             ImGui::Separator();
-            ImGui::Text("Vse luzy:");
             for (int i = 0; i < gs.pocketCount; i++) {
                 bool near = (i == gs.nearestIdx);
                 if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,0.3f,1));
-                ImGui::Text("  [%d]  X=%.2f  Y=%.2f%s",
-                    i, gs.pockets[i].x, gs.pockets[i].y,
-                    near ? "  <--" : "");
+                ImGui::Text("[%d] X=%.2f Y=%.2f%s",
+                    i, gs.pockets[i].x, gs.pockets[i].y, near ? " <--" : "");
                 if (near) ImGui::PopStyleColor();
             }
             if (gs.pocketCount == 0)
-                ImGui::TextColored(ImVec4(1,0.55f,0,1),
-                    "PocketNomButtons pust\n(rezhim bez vybora luzy)");
+                ImGui::TextColored(ImVec4(1,0.55f,0,1), "PocketButtons pust");
 
             ImGui::Separator();
-            // --- Шары ---
-            ImGui::Text("Shary:");
-            ImGui::Text("  Vsego:   %d", gs.totalBalls);
-            ImGui::Text("  Na stole:%d", gs.activeBalls);
-            ImGui::TextColored(ImVec4(0.5f,0.9f,1,1),
-                "  Zabito:  %d", gs.pocketedBalls);
+            ImGui::Text("Shary: vsego=%d active=%d zabito=%d",
+                gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
+            ImGui::Text("Kiy: X=%.2f Y=%.2f", gs.cueX, gs.cueY);
 
             ImGui::Separator();
-            // --- Debug ---
-            ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1),"[debug]");
-            ImGui::Text("cue X=%.2f Y=%.2f", gs.cueX, gs.cueY);
+            ImGui::TextColored(ImVec4(0.45f,0.45f,0.45f,1), "[dbg]");
             ImGui::Text("slide 0x%llX", (unsigned long long)gs.dbgSlide);
         }
 
@@ -355,16 +317,16 @@ static void DrawMenu()
     }
 
     ImGui::Separator();
-    ImGui::Checkbox("Demo window", &g_demoWindow);
+    ImGui::Checkbox("Demo", &g_demoWindow);
     ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
     ImGui::End();
 
     if (g_demoWindow) ImGui::ShowDemoWindow(&g_demoWindow);
 }
 
-// ==========================================================================
+// ============================================================
 //  OVERLAY VIEW
-// ==========================================================================
+// ============================================================
 
 @interface OverlayView : UIView <MTKViewDelegate>
 @property (nonatomic, strong) MTKView            *mtk;
@@ -381,29 +343,29 @@ static void DrawMenu()
     self = [super initWithFrame:frame];
     if (!self) return nil;
 
-    self.backgroundColor = UIColor.clearColor;
-    self.opaque = NO;
+    self.backgroundColor  = UIColor.clearColor;
+    self.opaque           = NO;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
     self.multipleTouchEnabled = YES;
 
     _device = MTLCreateSystemDefaultDevice();
-    _queue  = [_device newCommandQueue];
+    if (!_device) return nil;
+    _queue = [_device newCommandQueue];
 
     _mtk = [[MTKView alloc] initWithFrame:self.bounds device:_device];
-    _mtk.delegate               = self;
-    _mtk.autoresizingMask       = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
-    _mtk.colorPixelFormat       = MTLPixelFormatBGRA8Unorm;
-    _mtk.clearColor             = MTLClearColorMake(0,0,0,0);
-    _mtk.backgroundColor        = UIColor.clearColor;
-    _mtk.opaque                 = NO;
-    _mtk.layer.opaque           = NO;
-    _mtk.userInteractionEnabled = NO;
+    _mtk.delegate                 = self;
+    _mtk.autoresizingMask         = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+    _mtk.colorPixelFormat         = MTLPixelFormatBGRA8Unorm;
+    _mtk.clearColor               = MTLClearColorMake(0,0,0,0);
+    _mtk.backgroundColor          = UIColor.clearColor;
+    _mtk.opaque                   = NO;
+    _mtk.layer.opaque             = NO;
+    _mtk.userInteractionEnabled   = NO;
     _mtk.preferredFramesPerSecond = 60;
-    _mtk.paused = YES;
-    _mtk.hidden = YES;
+    _mtk.paused                   = YES;
+    _mtk.hidden                   = YES;
     [self addSubview:_mtk];
 
-    // --- ImGui ---
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
@@ -411,9 +373,7 @@ static void DrawMenu()
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(1.2f);
-
-    // Грузим шрифт с кириллицей
-    LoadCyrillicFont(18.0f);
+    LoadFont(18.0f);
     io.FontGlobalScale = 1.2f;
 
     ImGui_ImplMetal_Init(_device);
@@ -422,26 +382,25 @@ static void DrawMenu()
 
 - (void)toggleMenu
 {
-    self.menuOpen      = !self.menuOpen;
-    self.mtk.hidden    = !self.menuOpen;
-    self.mtk.paused    = !self.menuOpen;
+    self.menuOpen   = !self.menuOpen;
+    _mtk.hidden     = !self.menuOpen;
+    _mtk.paused     = !self.menuOpen;
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)event
 {
     if (!self.menuOpen) return nil;
-    ImGuiContext *g = ImGui::GetCurrentContext();
-    if (!g) return nil;
-    for (ImGuiWindow *w : g->Windows) {
+    ImGuiContext *ctx = ImGui::GetCurrentContext();
+    if (!ctx) return nil;
+    for (ImGuiWindow *w : ctx->Windows)
         if (w->Active && !w->Hidden &&
-            (w->Flags & ImGuiWindowFlags_NoInputs) == 0 &&
+            !(w->Flags & ImGuiWindowFlags_NoInputs) &&
             w->Rect().Contains(ImVec2((float)p.x,(float)p.y)))
             return self;
-    }
     return nil;
 }
 
-- (void)feed:(NSSet<UITouch *> *)touches down:(BOOL)down
+- (void)feed:(NSSet<UITouch*>*)touches down:(BOOL)down
 {
     UITouch *t = touches.anyObject;
     if (!t) return;
@@ -451,30 +410,30 @@ static void DrawMenu()
     io.AddMousePosEvent((float)p.x,(float)p.y);
     io.AddMouseButtonEvent(0, down);
 }
-- (void)touchesBegan:(NSSet*)t withEvent:(UIEvent*)e    { [self feed:t down:YES]; }
-- (void)touchesMoved:(NSSet*)t withEvent:(UIEvent*)e    { [self feed:t down:YES]; }
-- (void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e    { [self feed:t down:NO];  }
-- (void)touchesCancelled:(NSSet*)t withEvent:(UIEvent*)e{ [self feed:t down:NO];  }
+-(void)touchesBegan:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:YES]; }
+-(void)touchesMoved:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:YES]; }
+-(void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:NO];  }
+-(void)touchesCancelled:(NSSet*)t withEvent:(UIEvent*)e { [self feed:t down:NO];  }
 
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
+-(void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)s {}
 
-- (void)drawInMTKView:(MTKView *)view
+-(void)drawInMTKView:(MTKView*)view
 {
     CGSize b = view.bounds.size;
     CGSize d = view.drawableSize;
     if (b.width <= 0 || b.height <= 0) return;
 
     ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize           = ImVec2((float)b.width,(float)b.height);
+    io.DisplaySize             = ImVec2((float)b.width,(float)b.height);
     io.DisplayFramebufferScale = ImVec2((float)(d.width/b.width),(float)(d.height/b.height));
 
     static CFTimeInterval last = 0;
     CFTimeInterval now = CACurrentMediaTime();
-    io.DeltaTime = (last > 0) ? (float)(now - last) : (1.f/60.f);
+    io.DeltaTime = (last > 0) ? (float)(now-last) : 1.f/60.f;
     if (io.DeltaTime <= 0) io.DeltaTime = 1.f/60.f;
     last = now;
 
-    id<MTLCommandBuffer>          cb  = [self.queue commandBuffer];
+    id<MTLCommandBuffer> cb = [self.queue commandBuffer];
     MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
     if (!rpd) { [cb commit]; return; }
 
@@ -493,9 +452,9 @@ static void DrawMenu()
 }
 @end
 
-// ==========================================================================
-//  УСТАНОВКА В ИГРУ
-// ==========================================================================
+// ============================================================
+//  INSTALL
+// ============================================================
 
 static UIWindow *FindKeyWindow()
 {
@@ -520,8 +479,10 @@ static void TryInstall(int attempt)
                            dispatch_get_main_queue(), ^{ TryInstall(attempt+1); });
         return;
     }
+    if (g_overlay) return; // уже установлен
 
     g_overlay = [[OverlayView alloc] initWithFrame:w.bounds];
+    if (!g_overlay) return;
     [w addSubview:g_overlay];
 
     UITapGestureRecognizer *gr =
