@@ -1,7 +1,6 @@
 name: Build dylib
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
@@ -29,7 +28,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MyMenu-dylib
-          path: |
-            .theos/obj/MyMenu.dylib
-            .theos/obj/debug/MyMenu.dylib
+          path: .theos/obj/**/*.dylib
           if-no-files-found: error
