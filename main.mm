@@ -17,122 +17,92 @@
 #include <string.h>
 
 // ============================================================
-//  OFFSETS (IDA 8BP 56.29.2, reflection table 0xF04700)
-// ============================================================
-//  Global static ptr to AutoAim object: 0x104ECB0
-//    AutoAim + 0x78   -> GameManager*
-//    AutoAim + 0x88   -> GameManager* (fallback)
+//  OFFSETS  (IDA Pro, pool 56.29.2, base 0x100000000)
+//
+//  Global ptr to AutoAim obj : 0x104ECB0
+//    -> file offset           : 0x104ECB0 - 0x100000000 = 0x4ECB0
+//
+//  AutoAim + 0x78  -> GameManager*
+//  AutoAim + 0x88  -> GameManager* (fallback)
+//
 //  GameManager:
 //    +0x400 -> Table*
 //    +0x4D0 -> VisualCue*
 //    +0x720 -> mPocketNominationButtons.begin (vector<Button*>)
 //    +0x728 -> mPocketNominationButtons.end
+//
 //  Table:
 //    +0x468 -> mBalls.begin
 //    +0x470 -> mBalls.end
 //    +0x478 -> mTableShape.begin (vector<vec2f>)
 //    +0x480 -> mTableShape.end
-//  Ball:
-//    +0xA4  -> state (0=active, 1=pocketed)
-//  Button: +0x08 -> world X, +0x0C -> world Y
+//
+//  Ball   : +0xA4 -> state (0=active, 1=pocketed)
+//  Button : +0x08 -> world X,  +0x0C -> world Y
 //  VisualCue: +0x18 -> X, +0x1C -> Y
-
-// Адрес из IDA: 0x104ECB0
-// IDA показывает адреса с базой 0x100000000 (arm64 Mach-O default)
-// Реальный file-offset = IDA_addr - 0x100000000
-// При запуске: реальный адрес = slide + file_offset
-static const uintptr_t kAutoAimStatic = 0x104ECB0 - 0x100000000; // = 0x4ECB0
-
-// ============================================================
-//  SAFE READ — ObjC exception guard, никакого mincore
 // ============================================================
 
+static const uintptr_t kAutoAimFileOffset = 0x4ECB0; // IDA addr - 0x100000000
+
+// ============================================================
+//  BASE ADDRESS  (через mach_header, не vmaddr_slide)
+// ============================================================
+static uintptr_t g_base      = 0;
+static char      g_imageName[256] = {};
+
+static uintptr_t GetBase()
+{
+    if (g_base) return g_base;
+
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        const char *fname = strrchr(path, '/');
+        fname = fname ? fname + 1 : path;
+        // Главный бинарь игры называется "pool" (без расширения)
+        if (strcmp(fname, "pool") == 0) {
+            g_base = (uintptr_t)_dyld_get_image_header(i);
+            strncpy(g_imageName, path, sizeof(g_imageName) - 1);
+            return g_base;
+        }
+    }
+    // fallback: образ с путём .app/pool (не .dylib)
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        if (strstr(path, ".app/") && !strstr(path, ".dylib") && !strstr(path, ".framework")) {
+            g_base = (uintptr_t)_dyld_get_image_header(i);
+            strncpy(g_imageName, path, sizeof(g_imageName) - 1);
+            return g_base;
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+//  SAFE READ — @try/@catch, никакого mincore
+// ============================================================
 template<typename T>
 static T SafeRead(uintptr_t addr, T def = T{})
 {
-    // базовые sanity checks
-    if (addr < 0x100000000ULL || addr == (uintptr_t)-1) return def;
-    // выравнивание
+    // arm64 userspace: 0x100000000 .. 0x7FFFFFFFFFFF
+    if (addr < 0x100000000ULL || addr > 0x7FFFFFFFFFFFULL) return def;
     if (addr % alignof(T) != 0) return def;
     T val = def;
-    @try {
-        val = *(volatile T *)addr;
-    } @catch (...) {
-        val = def;
-    }
+    @try { val = *(volatile T *)addr; }
+    @catch (...) { val = def; }
     return val;
 }
 
 static bool IsPtr(uintptr_t p)
 {
-    // Валидный userspace arm64 указатель: 0x100000000 .. 0x7FFFFFFFFFFF
     return (p >= 0x100000000ULL && p <= 0x7FFFFFFFFFFFULL);
-}
-
-// ============================================================
-//  ASLR
-// ============================================================
-
-static uintptr_t g_slide     = 0;
-static int       g_slideIdx  = -1;  // индекс найденного образа
-static char      g_imageName[256] = {};
-
-// Ключевые слова для поиска главного бинаря (проверяем последний компонент пути)
-static const char *kGameNames[] = {
-    "pool",
-    "8BallPool",
-    "8 Ball Pool",
-    "miniclip",
-    nullptr
-};
-
-static uintptr_t GetSlide()
-{
-    if (g_slide) return g_slide;
-
-    uint32_t cnt = _dyld_image_count();
-
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *fullpath = _dyld_get_image_name(i);
-        if (!fullpath) continue;
-
-        // Берём только имя файла (после последнего '/')
-        const char *fname = strrchr(fullpath, '/');
-        fname = fname ? fname + 1 : fullpath;
-
-        for (int k = 0; kGameNames[k]; k++) {
-            // Точное совпадение имени файла (без учёта расширения не нужно — у pool нет)
-            if (strcmp(fname, kGameNames[k]) == 0) {
-                g_slide    = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-                g_slideIdx = (int)i;
-                strncpy(g_imageName, fullpath, sizeof(g_imageName)-1);
-                return g_slide;
-            }
-        }
-    }
-
-    // Fallback: образ с наибольшим slide среди тех что в .app/
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, ".app/") && !strstr(n, ".dylib")) {
-            g_slide    = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            g_slideIdx = (int)i;
-            strncpy(g_imageName, n, sizeof(g_imageName)-1);
-            return g_slide;
-        }
-    }
-
-    g_slide    = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
-    g_slideIdx = 0;
-    const char *n0 = _dyld_get_image_name(0);
-    strncpy(g_imageName, n0 ? n0 : "?", sizeof(g_imageName)-1);
-    return g_slide;
 }
 
 // ============================================================
 //  GAME STATE
 // ============================================================
-
 struct PocketInfo { float x, y; int idx; };
 
 struct GameState {
@@ -144,7 +114,8 @@ struct GameState {
     float nearestDist;
     int   totalBalls, activeBalls, pocketedBalls;
     float cueX, cueY;
-    uintptr_t dbgSlide, dbgAA, dbgGM, dbgTbl;
+    // debug
+    uintptr_t dbgBase, dbgAA, dbgGM, dbgTbl;
 };
 
 static GameState ReadGameState()
@@ -153,9 +124,15 @@ static GameState ReadGameState()
     s.nearestIdx  = -1;
     s.nearestDist = 1e9f;
 
-    s.dbgSlide = GetSlide();
+    uintptr_t base = GetBase();
+    s.dbgBase = base;
+    if (!base) {
+        snprintf(s.err, sizeof(s.err), "base=0, pool not found");
+        return s;
+    }
 
-    uintptr_t ptrAddr = s.dbgSlide + kAutoAimStatic;
+    // AutoAim ptr хранится в .data секции по file offset kAutoAimFileOffset
+    uintptr_t ptrAddr = base + kAutoAimFileOffset;
     uintptr_t aa      = SafeRead<uintptr_t>(ptrAddr);
     s.dbgAA = aa;
     if (!IsPtr(aa)) {
@@ -163,6 +140,7 @@ static GameState ReadGameState()
         return s;
     }
 
+    // GameManager
     uintptr_t gm = SafeRead<uintptr_t>(aa + 0x78);
     if (!IsPtr(gm)) gm = SafeRead<uintptr_t>(aa + 0x88);
     s.dbgGM = gm;
@@ -171,6 +149,7 @@ static GameState ReadGameState()
         return s;
     }
 
+    // Table
     uintptr_t tbl = SafeRead<uintptr_t>(gm + 0x400);
     s.dbgTbl = tbl;
     if (!IsPtr(tbl)) {
@@ -178,32 +157,30 @@ static GameState ReadGameState()
         return s;
     }
 
-    // Лунки через PocketNominationButtons
+    // Лунки — mPocketNominationButtons
     uintptr_t pkBeg = SafeRead<uintptr_t>(gm + 0x720);
     uintptr_t pkEnd = SafeRead<uintptr_t>(gm + 0x728);
     if (IsPtr(pkBeg) && IsPtr(pkEnd) && pkEnd >= pkBeg) {
         uintptr_t diff = pkEnd - pkBeg;
         if (diff > 0 && diff <= 6 * 8) {
-            int cnt = (int)(diff / sizeof(uintptr_t));
+            int cnt = (int)(diff / 8);
             for (int i = 0; i < cnt && i < 6; i++) {
                 uintptr_t btn = SafeRead<uintptr_t>(pkBeg + (uintptr_t)i * 8);
                 if (!IsPtr(btn)) continue;
                 float px = SafeRead<float>(btn + 0x08);
                 float py = SafeRead<float>(btn + 0x0C);
-                if (px == 0.f && py == 0.f) continue;
                 if (fabsf(px) > 5000.f || fabsf(py) > 5000.f) continue;
                 s.pockets[s.pocketCount++] = { px, py, i };
             }
         }
     }
 
-    // Fallback: mTableShape
+    // Fallback — mTableShape
     if (s.pocketCount == 0) {
         uintptr_t shBeg = SafeRead<uintptr_t>(tbl + 0x478);
         uintptr_t shEnd = SafeRead<uintptr_t>(tbl + 0x480);
         if (IsPtr(shBeg) && IsPtr(shEnd) && shEnd > shBeg) {
-            uintptr_t diff = shEnd - shBeg;
-            ptrdiff_t pts = (ptrdiff_t)(diff / 8);
+            ptrdiff_t pts = (ptrdiff_t)((shEnd - shBeg) / 8);
             if (pts >= 6 && pts <= 10000) {
                 int step = (int)(pts / 6);
                 for (int i = 0; i < 6; i++) {
@@ -229,7 +206,8 @@ static GameState ReadGameState()
                 uintptr_t ball = SafeRead<uintptr_t>(bbeg + (uintptr_t)i * 8);
                 if (!IsPtr(ball)) continue;
                 int st = SafeRead<int>(ball + 0xA4);
-                if (st == 1) s.pocketedBalls++; else s.activeBalls++;
+                if (st == 1) s.pocketedBalls++;
+                else         s.activeBalls++;
             }
         }
     }
@@ -254,43 +232,8 @@ static GameState ReadGameState()
 }
 
 // ============================================================
-//  FONT — грузим Arial с кириллицей, только если файл есть
-// ============================================================
-
-static void LoadFont(float sz)
-{
-    ImGuiIO &io = ImGui::GetIO();
-
-    const char *paths[] = {
-        "/System/Library/Fonts/Cache/ArialMT.ttf",
-        "/System/Library/Fonts/ArialMT.ttf",
-        "/System/Library/Fonts/Core/ArialMT.ttf",
-        nullptr
-    };
-
-    static ImVector<ImWchar> ranges;
-    if (ranges.empty()) {
-        ImFontGlyphRangesBuilder b;
-        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
-        b.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
-        b.BuildRanges(&ranges);
-    }
-
-    for (int i = 0; paths[i]; i++) {
-        FILE *f = fopen(paths[i], "rb");
-        if (!f) continue;
-        fclose(f);
-        if (io.Fonts->AddFontFromFileTTF(paths[i], sz, nullptr, ranges.Data))
-            return;
-    }
-    // fallback — ASCII
-    io.Fonts->AddFontDefault();
-}
-
-// ============================================================
 //  MENU
 // ============================================================
-
 static bool g_showPockets = false;
 static bool g_demoWindow  = false;
 
@@ -307,69 +250,68 @@ static void DrawMenu()
 
     if (g_showPockets) {
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f,0.08f,0.13f,0.95f));
-        ImGui::BeginChild("##pk", ImVec2(0,0), true);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.13f, 0.95f));
+        ImGui::BeginChild("##pk", ImVec2(0, 0), true);
 
         GameState gs = ReadGameState();
 
         if (!gs.valid) {
-            ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "Igra ne aktivna");
+            ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "Igra ne aktivna");
             ImGui::Text("err: %s", gs.err);
             ImGui::Separator();
-            ImGui::Text("slide   0x%llX", (unsigned long long)gs.dbgSlide);
-            ImGui::Text("image:  %s", g_imageName[0] ? g_imageName : "not found");
+            ImGui::Text("base    0x%llX", (unsigned long long)gs.dbgBase);
+            ImGui::Text("ptrAddr 0x%llX", (unsigned long long)(gs.dbgBase + kAutoAimFileOffset));
             ImGui::Text("autoAim 0x%llX", (unsigned long long)gs.dbgAA);
-            ImGui::Text("ptrAddr 0x%llX", (unsigned long long)(gs.dbgSlide + kAutoAimStatic));
             ImGui::Text("gameMgr 0x%llX", (unsigned long long)gs.dbgGM);
             ImGui::Text("table   0x%llX", (unsigned long long)gs.dbgTbl);
             ImGui::Separator();
-            // Список всех образов — чтобы найти правильное имя
-            ImGui::TextColored(ImVec4(0.8f,0.8f,0.3f,1), "All images (non-system):");
+            // Все non-system образы для диагностики
+            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.3f, 1), "Images:");
             uint32_t cnt = _dyld_image_count();
             for (uint32_t i = 0; i < cnt; i++) {
                 const char *n = _dyld_get_image_name(i);
                 if (!n) continue;
-                // Пропускаем системные библиотеки
-                if (strncmp(n, "/usr/lib",  8) == 0) continue;
-                if (strncmp(n, "/System",   7) == 0) continue;
+                if (strncmp(n, "/usr/lib", 8) == 0) continue;
+                if (strncmp(n, "/System",  7) == 0) continue;
                 if (strncmp(n, "/private/prebuilt", 17) == 0) continue;
-                uintptr_t sl = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-                const char *short_n = strrchr(n, '/') ? strrchr(n,'/')+1 : n;
-                ImGui::Text("[%u] 0x%llX  %s", i, (unsigned long long)sl, short_n);
+                uintptr_t hdr = (uintptr_t)_dyld_get_image_header(i);
+                const char *fn = strrchr(n, '/'); fn = fn ? fn+1 : n;
+                ImGui::Text("[%u] 0x%llX  %s", i, (unsigned long long)hdr, fn);
             }
         } else {
-            ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "Lunok: %d", gs.pocketCount);
+            ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Lunok: %d", gs.pocketCount);
 
             if (gs.nearestIdx >= 0) {
-                ImGui::TextColored(ImVec4(1,1,0.3f,1),
+                ImGui::TextColored(ImVec4(1, 1, 0.3f, 1),
                     "Blizhayshaya #%d  dist=%.1f",
                     gs.nearestIdx, gs.nearestDist);
                 ImGui::Text("  X=%.2f  Y=%.2f",
                     gs.pockets[gs.nearestIdx].x,
                     gs.pockets[gs.nearestIdx].y);
             } else {
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1), "Luzy: net dannykh");
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Luzy: net dannykh");
             }
 
             ImGui::Separator();
             for (int i = 0; i < gs.pocketCount; i++) {
                 bool near = (i == gs.nearestIdx);
-                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,0.3f,1));
+                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 0.3f, 1));
                 ImGui::Text("[%d] X=%.2f Y=%.2f%s",
                     i, gs.pockets[i].x, gs.pockets[i].y, near ? " <--" : "");
                 if (near) ImGui::PopStyleColor();
             }
             if (gs.pocketCount == 0)
-                ImGui::TextColored(ImVec4(1,0.55f,0,1), "PocketButtons pust");
+                ImGui::TextColored(ImVec4(1, 0.55f, 0, 1), "PocketButtons pust");
 
             ImGui::Separator();
-            ImGui::Text("Shary: vsego=%d active=%d zabito=%d",
+            ImGui::Text("Shary: vsego=%d  active=%d  zabito=%d",
                 gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
-            ImGui::Text("Kiy: X=%.2f Y=%.2f", gs.cueX, gs.cueY);
-
+            ImGui::Text("Kiy:   X=%.2f  Y=%.2f", gs.cueX, gs.cueY);
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.45f,0.45f,0.45f,1), "[dbg]");
-            ImGui::Text("slide 0x%llX", (unsigned long long)gs.dbgSlide);
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1), "[dbg]");
+            ImGui::Text("base 0x%llX", (unsigned long long)gs.dbgBase);
+            ImGui::Text("AA   0x%llX", (unsigned long long)gs.dbgAA);
+            ImGui::Text("GM   0x%llX", (unsigned long long)gs.dbgGM);
         }
 
         ImGui::EndChild();
@@ -387,7 +329,6 @@ static void DrawMenu()
 // ============================================================
 //  OVERLAY VIEW
 // ============================================================
-
 @interface OverlayView : UIView <MTKViewDelegate>
 @property (nonatomic, strong) MTKView            *mtk;
 @property (nonatomic, strong) id<MTLDevice>       device;
@@ -405,7 +346,7 @@ static void DrawMenu()
 
     self.backgroundColor  = UIColor.clearColor;
     self.opaque           = NO;
-    self.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.multipleTouchEnabled = YES;
 
     _device = MTLCreateSystemDefaultDevice();
@@ -414,9 +355,9 @@ static void DrawMenu()
 
     _mtk = [[MTKView alloc] initWithFrame:self.bounds device:_device];
     _mtk.delegate                 = self;
-    _mtk.autoresizingMask         = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+    _mtk.autoresizingMask         = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _mtk.colorPixelFormat         = MTLPixelFormatBGRA8Unorm;
-    _mtk.clearColor               = MTLClearColorMake(0,0,0,0);
+    _mtk.clearColor               = MTLClearColorMake(0, 0, 0, 0);
     _mtk.backgroundColor          = UIColor.clearColor;
     _mtk.opaque                   = NO;
     _mtk.layer.opaque             = NO;
@@ -426,6 +367,7 @@ static void DrawMenu()
     _mtk.hidden                   = YES;
     [self addSubview:_mtk];
 
+    // ImGui — только встроенный шрифт, никаких AddFontFromFileTTF
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
@@ -433,8 +375,8 @@ static void DrawMenu()
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(1.2f);
-    LoadFont(18.0f);
-    io.FontGlobalScale = 1.2f;
+    io.Fonts->AddFontDefault();   // только встроенный Proggy Clean, не крашит
+    io.FontGlobalScale = 1.5f;    // увеличим чтобы было читаемо
 
     ImGui_ImplMetal_Init(_device);
     return self;
@@ -442,9 +384,9 @@ static void DrawMenu()
 
 - (void)toggleMenu
 {
-    self.menuOpen   = !self.menuOpen;
-    _mtk.hidden     = !self.menuOpen;
-    _mtk.paused     = !self.menuOpen;
+    self.menuOpen = !self.menuOpen;
+    _mtk.hidden   = !self.menuOpen;
+    _mtk.paused   = !self.menuOpen;
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)event
@@ -455,45 +397,45 @@ static void DrawMenu()
     for (ImGuiWindow *w : ctx->Windows)
         if (w->Active && !w->Hidden &&
             !(w->Flags & ImGuiWindowFlags_NoInputs) &&
-            w->Rect().Contains(ImVec2((float)p.x,(float)p.y)))
+            w->Rect().Contains(ImVec2((float)p.x, (float)p.y)))
             return self;
     return nil;
 }
 
-- (void)feed:(NSSet<UITouch*>*)touches down:(BOOL)down
+- (void)feed:(NSSet<UITouch *> *)touches down:(BOOL)down
 {
     UITouch *t = touches.anyObject;
     if (!t) return;
     CGPoint p = [t locationInView:self];
     ImGuiIO &io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    io.AddMousePosEvent((float)p.x,(float)p.y);
+    io.AddMousePosEvent((float)p.x, (float)p.y);
     io.AddMouseButtonEvent(0, down);
 }
--(void)touchesBegan:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:YES]; }
--(void)touchesMoved:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:YES]; }
--(void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:NO];  }
--(void)touchesCancelled:(NSSet*)t withEvent:(UIEvent*)e { [self feed:t down:NO];  }
+- (void)touchesBegan:(NSSet *)t withEvent:(UIEvent *)e      { [self feed:t down:YES]; }
+- (void)touchesMoved:(NSSet *)t withEvent:(UIEvent *)e      { [self feed:t down:YES]; }
+- (void)touchesEnded:(NSSet *)t withEvent:(UIEvent *)e      { [self feed:t down:NO];  }
+- (void)touchesCancelled:(NSSet *)t withEvent:(UIEvent *)e  { [self feed:t down:NO];  }
 
--(void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)s {}
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)s {}
 
--(void)drawInMTKView:(MTKView*)view
+- (void)drawInMTKView:(MTKView *)view
 {
     CGSize b = view.bounds.size;
     CGSize d = view.drawableSize;
     if (b.width <= 0 || b.height <= 0) return;
 
     ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize             = ImVec2((float)b.width,(float)b.height);
-    io.DisplayFramebufferScale = ImVec2((float)(d.width/b.width),(float)(d.height/b.height));
+    io.DisplaySize             = ImVec2((float)b.width, (float)b.height);
+    io.DisplayFramebufferScale = ImVec2((float)(d.width / b.width), (float)(d.height / b.height));
 
     static CFTimeInterval last = 0;
     CFTimeInterval now = CACurrentMediaTime();
-    io.DeltaTime = (last > 0) ? (float)(now-last) : 1.f/60.f;
-    if (io.DeltaTime <= 0) io.DeltaTime = 1.f/60.f;
+    io.DeltaTime = (last > 0) ? (float)(now - last) : 1.f / 60.f;
+    if (io.DeltaTime <= 0) io.DeltaTime = 1.f / 60.f;
     last = now;
 
-    id<MTLCommandBuffer> cb = [self.queue commandBuffer];
+    id<MTLCommandBuffer>     cb  = [self.queue commandBuffer];
     MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
     if (!rpd) { [cb commit]; return; }
 
@@ -515,7 +457,6 @@ static void DrawMenu()
 // ============================================================
 //  INSTALL
 // ============================================================
-
 static UIWindow *FindKeyWindow()
 {
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -536,10 +477,10 @@ static void TryInstall(int attempt)
     if (!w || !w.rootViewController.view) {
         if (attempt < 60)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{ TryInstall(attempt+1); });
+                           dispatch_get_main_queue(), ^{ TryInstall(attempt + 1); });
         return;
     }
-    if (g_overlay) return; // уже установлен
+    if (g_overlay) return;
 
     g_overlay = [[OverlayView alloc] initWithFrame:w.bounds];
     if (!g_overlay) return;
