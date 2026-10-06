@@ -18,17 +18,7 @@
 #include <string.h>
 
 // ============================================================
-//  GameManager через ObjC runtime (реверс рабочего мода poolLIB.dylib)
-//
-//  Цепочка:
-//    objc_getClass("GameManager") -> Class
-//    [Class sharedGameManager]    -> id gm
-//    [gm table]                   -> id table (объект стола)
-//    [table getPockets]           -> C++ vector-like: ptr[0]=begin, ptr[1]=end
-//                                    каждый элемент = 16 байт (double x, double y)
-//    [table balls]                -> аналогично, элементы = ball объекты
-//    [table getPocketRadius]      -> double
-//    [gm visualCue]               -> id cue
+//  Вспомогательные функции
 // ============================================================
 
 static id SafeMsgSend(id obj, const char *selName)
@@ -47,39 +37,53 @@ static double SafeMsgSendDouble(id obj, const char *selName)
     return ((double(*)(id,SEL))objc_msgSend)(obj, sel);
 }
 
-// Читаем C++ vector-like структуру: ptr[0]=begin, ptr[1]=end, элемент=16 байт (double x,y)
-// Возвращает количество точек, заполняет out[] (макс maxCount)
+// Получаем number шара через ivar — именно так делает рабочий мод
+static int GetBallNumber(id ball)
+{
+    if (!ball) return -1;
+    Class cls = object_getClass(ball);
+    if (!cls) return -1;
+    Ivar ivar = class_getInstanceVariable(cls, "number");
+    if (!ivar) return -1;
+    ptrdiff_t off = ivar_getOffset(ivar);
+    if (off < 0) return -1;
+    return *(int *)((uint8_t *)(__bridge void *)ball + off);
+}
+
+// Читаем C++ vector<double2>: ptr[0]=begin, ptr[1]=end, элемент=16 байт (double x, double y)
+// ВАЖНО: @try НЕ ловит EXC_BAD_ACCESS — поэтому проверяем указатели вручную
 static int ReadVectorOfPoints(id obj, const char *selName, double *outX, double *outY, int maxCount)
 {
     if (!obj) return 0;
     SEL sel = sel_registerName(selName);
     if (![obj respondsToSelector:sel]) return 0;
 
-    // Возвращает указатель на C++ vector-like структуру
     uintptr_t *vec = (uintptr_t *)((uintptr_t(*)(id,SEL))objc_msgSend)(obj, sel);
     if (!vec) return 0;
 
-    @try {
-        uintptr_t begin = vec[0];
-        uintptr_t end   = vec[1];
-        if (!begin || !end || end < begin) return 0;
-        uintptr_t diff = end - begin;
-        int cnt = (int)(diff / 16);
-        if (cnt <= 0 || cnt > 64) return 0;
-        cnt = cnt < maxCount ? cnt : maxCount;
-        for (int i = 0; i < cnt; i++) {
-            @try {
-                double *elem = (double *)(begin + (uintptr_t)i * 16);
-                double x = elem[0];
-                double y = elem[1];
-                // Проверяем на NaN/Inf
-                if (isnan(x) || isinf(x) || isnan(y) || isinf(y)) continue;
-                outX[i] = x;
-                outY[i] = y;
-            } @catch (...) { return i; }
-        }
-        return cnt;
-    } @catch (...) { return 0; }
+    // Проверяем что сам vec читаем — он должен быть ObjC объектом возвращённым через msgSend,
+    // значит память валидна. Но begin/end внутри могут быть мусором.
+    uintptr_t begin = vec[0];
+    uintptr_t end   = vec[1];
+
+    // Санити-чек: begin и end должны быть разумными указателями
+    if (begin == 0 || end == 0 || end < begin) return 0;
+    uintptr_t diff = end - begin;
+    // Максимум 6 лунок * 16 байт = 96 байт, минимум 1 * 16 = 16
+    if (diff < 16 || diff > 96) return 0;
+
+    int cnt = (int)(diff / 16);
+    cnt = cnt < maxCount ? cnt : maxCount;
+
+    for (int i = 0; i < cnt; i++) {
+        double *elem = (double *)(begin + (uintptr_t)i * 16);
+        double x = elem[0];
+        double y = elem[1];
+        if (isnan(x) || isinf(x) || isnan(y) || isinf(y)) continue;
+        outX[i] = x;
+        outY[i] = y;
+    }
+    return cnt;
 }
 
 static id GetGameManager()
@@ -115,83 +119,72 @@ static GameState ReadGameState()
     s.nearestDist = 1e9f;
 
     @try {
-        // 1. GameManager синглтон
+        // 1. GameManager
         id gm = GetGameManager();
         if (!gm) {
-            snprintf(s.err, sizeof(s.err), "GameManager class not found");
+            snprintf(s.err, sizeof(s.err), "GameManager not found");
             return s;
         }
 
-        // 2. Table объект
+        // 2. Table
         id table = SafeMsgSend(gm, "table");
         if (!table) {
-            snprintf(s.err, sizeof(s.err), "gm.table = nil (not in match?)");
+            snprintf(s.err, sizeof(s.err), "table = nil");
             return s;
         }
 
-        // 3. tableProperties — именно на нём живут getPockets/getPocketRadius
-        id tableProps = SafeMsgSend(table, "tableProperties");
-        if (!tableProps) {
-            snprintf(s.err, sizeof(s.err), "table.tableProperties = nil");
-            return s;
-        }
-
-        // Лунки — getPockets на tableProperties
-        double pxArr[6], pyArr[6];
-        int cnt = ReadVectorOfPoints(tableProps, "getPockets", pxArr, pyArr, 6);
+        // 3. Лунки — getPockets на table (НЕ на tableProperties)
+        double pxArr[6] = {}, pyArr[6] = {};
+        int cnt = ReadVectorOfPoints(table, "getPockets", pxArr, pyArr, 6);
         if (cnt == 0)
-            cnt = ReadVectorOfPoints(tableProps, "getPocketAimPoints", pxArr, pyArr, 6);
+            cnt = ReadVectorOfPoints(table, "getPocketAimPoints", pxArr, pyArr, 6);
 
         s.pocketCount = cnt;
         for (int i = 0; i < cnt; i++)
             s.pockets[i] = { (float)pxArr[i], (float)pyArr[i], i };
 
-        // 4. Радиус лунки — тоже на tableProperties
-        s.pocketRadius = (float)SafeMsgSendDouble(tableProps, "getPocketRadius");
-        // Защита от NaN/Inf/0
+        // 4. Радиус лунки — на table
+        s.pocketRadius = (float)SafeMsgSendDouble(table, "getPocketRadius");
         if (s.pocketRadius != s.pocketRadius || s.pocketRadius < 0.01f || s.pocketRadius > 1000.f)
             s.pocketRadius = 0.3f;
 
         // 5. Шары — [table balls]
-        // balls может быть NSArray или C++ vector — проверяем оба варианта
         id ballsObj = SafeMsgSend(table, "balls");
         if (ballsObj &&
             [ballsObj respondsToSelector:@selector(count)] &&
             [ballsObj respondsToSelector:@selector(objectAtIndex:)]) {
-            @try {
-                NSUInteger bCount = [ballsObj count];
-                if (bCount > 0 && bCount <= 32) {
-                    s.totalBalls = (int)bCount;
-                    for (NSUInteger i = 0; i < bCount; i++) {
-                        @autoreleasepool {
-                            id ball = nil;
-                            @try { ball = [ballsObj objectAtIndex:i]; } @catch (...) { s.activeBalls++; continue; }
-                            if (!ball) { s.activeBalls++; continue; }
-                            @try {
-                                if (![ball respondsToSelector:sel_registerName("position")]) {
-                                    s.activeBalls++;
-                                    continue;
-                                }
-                                CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, sel_registerName("position"));
-                                if (isinf(pos.x) || isinf(pos.y) || isnan(pos.x) || isnan(pos.y)) {
-                                    s.pocketedBalls++;
-                                } else {
-                                    s.activeBalls++;
-                                    @try {
-                                        if ([ball respondsToSelector:sel_registerName("number")]) {
-                                            int num = ((int(*)(id,SEL))objc_msgSend)(ball, sel_registerName("number"));
-                                            if (num == 0) { s.cueX = (float)pos.x; s.cueY = (float)pos.y; }
-                                        }
-                                    } @catch (...) {}
-                                }
-                            } @catch (...) { s.activeBalls++; }
-                        }
+
+            NSUInteger bCount = [ballsObj count];
+            if (bCount > 0 && bCount <= 32) {
+                s.totalBalls = (int)bCount;
+                for (NSUInteger i = 0; i < bCount; i++) {
+                    id ball = [ballsObj objectAtIndex:i];
+                    if (!ball) { s.activeBalls++; continue; }
+
+                    // position — подтверждён в дизасме
+                    SEL posSel = sel_registerName("position");
+                    if (![ball respondsToSelector:posSel]) { s.activeBalls++; continue; }
+
+                    CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, posSel);
+
+                    // Забитый шар — position == INFINITY (подтверждено в дизасме)
+                    if (isinf(pos.x) || isinf(pos.y) || isnan(pos.x) || isnan(pos.y)) {
+                        s.pocketedBalls++;
+                        continue;
+                    }
+                    s.activeBalls++;
+
+                    // Белый шар — number==0 через ivar (подтверждено в дизасме)
+                    int num = GetBallNumber(ball);
+                    if (num == 0) {
+                        s.cueX = (float)pos.x;
+                        s.cueY = (float)pos.y;
                     }
                 }
-            } @catch (...) {}
+            }
         }
 
-        // 7. Ближайшая лунка
+        // 6. Ближайшая лунка
         for (int i = 0; i < s.pocketCount; i++) {
             float dx = s.pockets[i].x - s.cueX;
             float dy = s.pockets[i].y - s.cueY;
@@ -239,34 +232,30 @@ static void DrawMenu()
             ImGui::Text("err: %s", gs.err);
         } else {
             ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1),
-                "Lunok: %d  radius=%.2f", gs.pocketCount, gs.pocketRadius);
+                "Lunok: %d  r=%.2f", gs.pocketCount, gs.pocketRadius);
 
             if (gs.nearestIdx >= 0) {
                 ImGui::TextColored(ImVec4(1, 1, 0.3f, 1),
-                    "Blizhayshaya #%d  dist=%.1f",
+                    "Blizh #%d  dist=%.1f",
                     gs.nearestIdx, gs.nearestDist);
                 ImGui::Text("  X=%.2f  Y=%.2f",
                     gs.pockets[gs.nearestIdx].x,
                     gs.pockets[gs.nearestIdx].y);
-            } else {
-                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Luzy: net dannykh");
             }
 
             ImGui::Separator();
             for (int i = 0; i < gs.pocketCount; i++) {
                 bool near = (i == gs.nearestIdx);
-                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 0.3f, 1));
-                ImGui::Text("[%d] X=%.2f Y=%.2f%s",
+                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,0.3f,1));
+                ImGui::Text("[%d] X=%.1f Y=%.1f%s",
                     i, gs.pockets[i].x, gs.pockets[i].y, near ? " <--" : "");
                 if (near) ImGui::PopStyleColor();
             }
-            if (gs.pocketCount == 0)
-                ImGui::TextColored(ImVec4(1, 0.55f, 0, 1), "getPockets = nil");
 
             ImGui::Separator();
-            ImGui::Text("Shary: vsego=%d  active=%d  zabito=%d",
+            ImGui::Text("Shary: %d  active=%d  zabito=%d",
                 gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
-            ImGui::Text("Kiy (bel shar): X=%.2f  Y=%.2f", gs.cueX, gs.cueY);
+            ImGui::Text("Kiy: X=%.1f  Y=%.1f", gs.cueX, gs.cueY);
         }
 
         ImGui::EndChild();
