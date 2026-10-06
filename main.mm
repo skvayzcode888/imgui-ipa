@@ -49,6 +49,19 @@ static double SafeCallDouble(id obj, const char *sel_name)
     return ((double(*)(id,SEL))objc_msgSend)(obj, s);
 }
 
+// getPocketRadius возвращает C++ тип через sret (x8), НЕ double в d0.
+// Реальный код в pool: str x9,[x8] — пишет по x8=указатель на буфер.
+// Объявляем структуру > 16 байт => компилятор сам выставит x8.
+struct SretBuf { double v; uint8_t pad[56]; };
+
+static double GetPocketRadius(id tp)
+{
+    SEL s = sel_registerName("getPocketRadius");
+    if (!tp || ![tp respondsToSelector:s]) return 0.3;
+    SretBuf r = ((SretBuf(*)(id,SEL))objc_msgSend)(tp, s);
+    return r.v;
+}
+
 // number через ivar — подтверждено дизасмом 0x17db8
 static int BallNumber(id ball)
 {
@@ -155,8 +168,8 @@ static GameState ReadGameState()
         for (int i = 0; i < cnt; i++)
             s.pockets[i] = { (float)px[i], (float)py[i], i };
 
-        // Радиус
-        double r = SafeCallDouble(tp, "getPocketRadius");
+        // Радиус — возвращается через sret (x8), не через d0
+        double r = GetPocketRadius(tp);
         s.pocketRadius = (r > 0.01 && r < 1000.0 && r == r) ? (float)r : 0.3f;
 
         // Шары
