@@ -12,6 +12,8 @@
 #include "imgui_internal.h"
 #include "imgui_impl_metal.h"
 
+#import <mach-o/dyld.h>
+
 #include <stdint.h>
 #include <math.h>
 #include <stdio.h>
