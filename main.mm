@@ -142,38 +142,54 @@ static GameState ReadGameState()
 
         // 4. Радиус лунки — тоже на tableProperties
         s.pocketRadius = (float)SafeMsgSendDouble(tableProps, "getPocketRadius");
-        if (s.pocketRadius < 0.01f) s.pocketRadius = 0.3f;
+        // Защита от NaN/Inf/0
+        if (s.pocketRadius != s.pocketRadius || s.pocketRadius < 0.01f || s.pocketRadius > 1000.f)
+            s.pocketRadius = 0.3f;
 
-        // 5. Шары — [table balls]
+        // 5. Шары — [table balls], забитый = position.x == INFINITY
         id ballsObj = SafeMsgSend(table, "balls");
         if (ballsObj && [ballsObj respondsToSelector:@selector(count)]) {
-            NSArray *balls = (NSArray *)ballsObj;
-            s.totalBalls = (int)balls.count;
-            for (id ball in balls) {
-                @try {
-                    BOOL pocketed = NO;
-                    if ([ball respondsToSelector:sel_registerName("isPocketed")])
-                        pocketed = ((BOOL(*)(id,SEL))objc_msgSend)(ball, sel_registerName("isPocketed"));
-                    else if ([ball respondsToSelector:sel_registerName("pocketed")])
-                        pocketed = ((BOOL(*)(id,SEL))objc_msgSend)(ball, sel_registerName("pocketed"));
-                    if (pocketed) s.pocketedBalls++;
-                    else          s.activeBalls++;
-                } @catch (...) { s.activeBalls++; }
-            }
-        }
-
-        // 6. Позиция кия — [gm visualCue] -> position
-        id cue = SafeMsgSend(gm, "visualCue");
-        if (cue) {
             @try {
-                // Пробуем CGPoint position
-                if ([cue respondsToSelector:sel_registerName("position")]) {
-                    CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(cue, sel_registerName("position"));
-                    s.cueX = (float)pos.x;
-                    s.cueY = (float)pos.y;
+                NSArray *balls = [(NSArray *)ballsObj copy];
+                s.totalBalls = (int)balls.count;
+                for (id ball in balls) {
+                    @try {
+                        if (![ball respondsToSelector:sel_registerName("position")]) {
+                            s.activeBalls++;
+                            continue;
+                        }
+                        CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, sel_registerName("position"));
+                        // Забитый шар имеет позицию INFINITY
+                        if (isinf(pos.x) || isinf(pos.y) || isnan(pos.x) || isnan(pos.y)) {
+                            s.pocketedBalls++;
+                            continue;
+                        }
+                        s.activeBalls++;
+                        // Белый шар (cue ball) — number=0, его позиция = позиция кия
+                        // Читаем через ivar
+                        @try {
+                            Class ballClass = object_getClass(ball);
+                            Ivar numIvar = class_getInstanceVariable(ballClass, "number");
+                            if (numIvar) {
+                                ptrdiff_t off = ivar_getOffset(numIvar);
+                                if ((off & (ptrdiff_t)0x8000000000000000LL) == 0) {
+                                    int num = *(int *)((char *)(__bridge void*)ball + off);
+                                    if (num == 0) { // белый шар
+                                        s.cueX = (float)pos.x;
+                                        s.cueY = (float)pos.y;
+                                    }
+                                }
+                            }
+                        } @catch (...) {}
+                    } @catch (...) { s.activeBalls++; }
                 }
+                [balls release];
             } @catch (...) {}
         }
+
+        // 6. Угол прицеливания из visualCue (бонус — для будущего использования)
+        id cue = SafeMsgSend(gm, "visualCue");
+        (void)cue; // пока не используем
 
         // 7. Ближайшая лунка
         for (int i = 0; i < s.pocketCount; i++) {
@@ -204,7 +220,7 @@ static void DrawMenu()
 {
     ImGui::SetNextWindowSize(ImVec2(340, 400), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos (ImVec2(40,  60),  ImGuiCond_FirstUseEver);
-    ImGui::Begin("crown.pw");
+    ImGui::Begin("skvayz mod 8 ball pool | Beta.pw");
 
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
@@ -250,7 +266,7 @@ static void DrawMenu()
             ImGui::Separator();
             ImGui::Text("Shary: vsego=%d  active=%d  zabito=%d",
                 gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
-            ImGui::Text("Kiy:   X=%.2f  Y=%.2f", gs.cueX, gs.cueY);
+            ImGui::Text("Kiy (bel shar): X=%.2f  Y=%.2f", gs.cueX, gs.cueY);
         }
 
         ImGui::EndChild();
