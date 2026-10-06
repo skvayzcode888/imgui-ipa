@@ -49,17 +49,25 @@ static double SafeCallDouble(id obj, const char *sel_name)
     return ((double(*)(id,SEL))objc_msgSend)(obj, s);
 }
 
-// getPocketRadius возвращает C++ тип через sret (x8), НЕ double в d0.
-// Реальный код в pool: str x9,[x8] — пишет по x8=указатель на буфер.
-// Объявляем структуру > 16 байт => компилятор сам выставит x8.
-struct SretBuf { double v; uint8_t pad[56]; };
+// position и getPocketRadius возвращают C++ типы через sret (x8).
+// Структура > 16 байт => компилятор выставит x8 автоматически.
+struct SretBuf { double v[8]; }; // 64 байта, x8 гарантированно выставляется
 
 static double GetPocketRadius(id tp)
 {
     SEL s = sel_registerName("getPocketRadius");
     if (!tp || ![tp respondsToSelector:s]) return 0.3;
     SretBuf r = ((SretBuf(*)(id,SEL))objc_msgSend)(tp, s);
-    return r.v;
+    return r.v[0];
+}
+
+static CGPoint GetBallPosition(id ball)
+{
+    SEL s = sel_registerName("position");
+    if (!ball || ![ball respondsToSelector:s]) return CGPointMake(NAN, NAN);
+    SretBuf r = ((SretBuf(*)(id,SEL))objc_msgSend)(ball, s);
+    // CGPoint = double x, double y — первые 16 байт
+    return CGPointMake(r.v[0], r.v[1]);
 }
 
 // number через ivar — подтверждено дизасмом 0x17db8
@@ -188,7 +196,8 @@ static GameState ReadGameState()
                     SEL posSel = sel_registerName("position");
                     if (![ball respondsToSelector:posSel]) { s.activeBalls++; continue; }
 
-                    CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, posSel);
+                    // position возвращает через sret (x8) — подтверждено дизасмом MyMenu+0x47DC
+                    CGPoint pos = GetBallPosition(ball);
 
                     if (!isfinite(pos.x) || !isfinite(pos.y)) {
                         s.pocketedBalls++;
