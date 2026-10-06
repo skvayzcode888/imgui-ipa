@@ -5,7 +5,8 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <mach-o/dyld.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -17,86 +18,39 @@
 #include <string.h>
 
 // ============================================================
-//  OFFSETS  (IDA Pro, pool 56.29.2, base 0x100000000)
+//  GameManager через ObjC runtime (реверс рабочего мода poolLIB.dylib)
 //
-//  GameManager — статический объект в BSS (не pointer!):
-//    IDA addr   : 0x104BC90
-//    file offset: 0x104BC90 - 0x100000000 = 0x4BC90
-//    runtime    : image_base + 0x4BC90  <- это сам объект
-//
-//  GameManager:
-//    +0x400 -> Table*
-//    +0x4D0 -> VisualCue*
-//    +0x720 -> mPocketNominationButtons.begin (vector<Button*>)
-//    +0x728 -> mPocketNominationButtons.end
-//
-//  Table:
-//    +0x468 -> mBalls.begin
-//    +0x470 -> mBalls.end
-//    +0x478 -> mTableShape.begin (vector<vec2f>)
-//    +0x480 -> mTableShape.end
-//
-//  Ball   : +0xA4 -> state (0=active, 1=pocketed)
-//  Button : +0x08 -> world X,  +0x0C -> world Y
-//  VisualCue: +0x18 -> X,  +0x1C -> Y
+//  Методы GameManager:
+//    +sharedGameManager   -> id  (синглтон)
+//    -getPockets          -> NSArray<NSValue*> (CGPoint каждой лунки)
+//    -getPocketAimPoints  -> NSArray<NSValue*> (CGPoint точек прицеливания)
+//    -getPocketRadius     -> double
+//    -visualCue           -> id (объект кия)
 // ============================================================
 
-static const uintptr_t kGameMgrFileOffset = 0x4BC90; // IDA 0x104BC90 - 0x100000000
-
-// ============================================================
-//  BASE ADDRESS  (через mach_header, не vmaddr_slide)
-// ============================================================
-static uintptr_t g_base      = 0;
-static char      g_imageName[256] = {};
-
-static uintptr_t GetBase()
+// Безопасный вызов ObjC метода — возвращает nil если класс/метод не существует
+static id SafeMsgSend(id obj, const char *selName)
 {
-    if (g_base) return g_base;
-
-    uint32_t cnt = _dyld_image_count();
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *path = _dyld_get_image_name(i);
-        if (!path) continue;
-        const char *fname = strrchr(path, '/');
-        fname = fname ? fname + 1 : path;
-        // Главный бинарь игры называется "pool" (без расширения)
-        if (strcmp(fname, "pool") == 0) {
-            g_base = (uintptr_t)_dyld_get_image_header(i);
-            strncpy(g_imageName, path, sizeof(g_imageName) - 1);
-            return g_base;
-        }
-    }
-    // fallback: образ с путём .app/pool (не .dylib)
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *path = _dyld_get_image_name(i);
-        if (!path) continue;
-        if (strstr(path, ".app/") && !strstr(path, ".dylib") && !strstr(path, ".framework")) {
-            g_base = (uintptr_t)_dyld_get_image_header(i);
-            strncpy(g_imageName, path, sizeof(g_imageName) - 1);
-            return g_base;
-        }
-    }
-    return 0;
+    if (!obj) return nil;
+    SEL sel = sel_registerName(selName);
+    if (![obj respondsToSelector:sel]) return nil;
+    return ((id(*)(id,SEL))objc_msgSend)(obj, sel);
 }
 
-// ============================================================
-//  SAFE READ — @try/@catch, никакого mincore
-// ============================================================
-template<typename T>
-static T SafeRead(uintptr_t addr, T def = T{})
+static double SafeMsgSendDouble(id obj, const char *selName)
 {
-    // arm64 userspace: 0x100000000 .. 0x7FFFFFFFFFFF
-    if (addr < 0x100000000ULL || addr > 0x7FFFFFFFFFFFULL) return def;
-    if (addr % alignof(T) != 0) return def;
-    T val = def;
-    @try { val = *(volatile T *)addr; }
-    @catch (...) { val = def; }
-    return val;
+    if (!obj) return 0.0;
+    SEL sel = sel_registerName(selName);
+    if (![obj respondsToSelector:sel]) return 0.0;
+    return ((double(*)(id,SEL))objc_msgSend)(obj, sel);
 }
 
-static bool IsPtr(uintptr_t p)
+static id GetGameManager()
 {
-    return (p >= 0x100000000ULL && p <= 0x7FFFFFFFFFFFULL);
+    Class cls = objc_getClass("GameManager");
+    if (!cls) return nil;
+    if (![cls respondsToSelector:sel_registerName("sharedGameManager")]) return nil;
+    return ((id(*)(id,SEL))objc_msgSend)((id)cls, sel_registerName("sharedGameManager"));
 }
 
 // ============================================================
@@ -111,10 +65,9 @@ struct GameState {
     PocketInfo pockets[6];
     int   nearestIdx;
     float nearestDist;
+    float pocketRadius;
     int   totalBalls, activeBalls, pocketedBalls;
     float cueX, cueY;
-    // debug
-    uintptr_t dbgBase, dbgAA, dbgGM, dbgTbl;
 };
 
 static GameState ReadGameState()
@@ -123,111 +76,92 @@ static GameState ReadGameState()
     s.nearestIdx  = -1;
     s.nearestDist = 1e9f;
 
-    uintptr_t base = GetBase();
-    s.dbgBase = base;
-    if (!base) {
-        snprintf(s.err, sizeof(s.err), "base=0, pool not found");
-        return s;
-    }
-
-    // GameManager — статический объект, живёт прямо по этому адресу
-    // IDA: unk_104BC90, file offset = 0x4BC90
-    uintptr_t gm = base + kGameMgrFileOffset;
-    s.dbgAA = gm;  // dbgAA теперь = GameManager addr для отображения
-    s.dbgGM = gm;
-    if (!IsPtr(gm)) {
-        snprintf(s.err, sizeof(s.err), "GM addr invalid: 0x%llX", (unsigned long long)gm);
-        return s;
-    }
-
-    // Проверяем что vtable читается — маскируем PAC биты (arm64e)
-    uintptr_t vtbl = SafeRead<uintptr_t>(gm) & 0x0000FFFFFFFFFFFFull;
-    if (!IsPtr(vtbl)) {
-        snprintf(s.err, sizeof(s.err), "GM not initialized yet");
-        return s;
-    }
-
-    // Table* — читаем как pointer из GameManager+0x400, снимаем PAC
-    uintptr_t tbl = SafeRead<uintptr_t>(gm + 0x400) & 0x0000FFFFFFFFFFFFull;
-    s.dbgTbl = tbl;
-    if (!IsPtr(tbl)) {
-        snprintf(s.err, sizeof(s.err), "Table=0 (enter a match first)");
-        return s;
-    }
-
-    // VisualCue*
-    uintptr_t vc = SafeRead<uintptr_t>(gm + 0x4D0) & 0x0000FFFFFFFFFFFFull;
-
-    // mPocketNominationButtons vector
-    uintptr_t pkBeg = SafeRead<uintptr_t>(gm + 0x720) & 0x0000FFFFFFFFFFFFull;
-    uintptr_t pkEnd = SafeRead<uintptr_t>(gm + 0x728) & 0x0000FFFFFFFFFFFFull;
-    if (IsPtr(pkBeg) && IsPtr(pkEnd) && pkEnd >= pkBeg) {
-        uintptr_t diff = pkEnd - pkBeg;
-        if (diff > 0 && diff <= 6 * 8) {
-            int cnt = (int)(diff / 8);
-            for (int i = 0; i < cnt && i < 6; i++) {
-                uintptr_t btn = SafeRead<uintptr_t>(pkBeg + (uintptr_t)i * 8);
-                if (!IsPtr(btn)) continue;
-                float px = SafeRead<float>(btn + 0x08);
-                float py = SafeRead<float>(btn + 0x0C);
-                if (fabsf(px) > 5000.f || fabsf(py) > 5000.f) continue;
-                s.pockets[s.pocketCount++] = { px, py, i };
-            }
+    @try {
+        id gm = GetGameManager();
+        if (!gm) {
+            snprintf(s.err, sizeof(s.err), "GameManager not found");
+            return s;
         }
-    }
 
-    // Fallback — mTableShape
-    if (s.pocketCount == 0) {
-        uintptr_t shBeg = SafeRead<uintptr_t>(tbl + 0x478);
-        uintptr_t shEnd = SafeRead<uintptr_t>(tbl + 0x480);
-        if (IsPtr(shBeg) && IsPtr(shEnd) && shEnd > shBeg) {
-            ptrdiff_t pts = (ptrdiff_t)((shEnd - shBeg) / 8);
-            if (pts >= 6 && pts <= 10000) {
-                int step = (int)(pts / 6);
-                for (int i = 0; i < 6; i++) {
-                    uintptr_t pt = shBeg + (uintptr_t)(i * step * 8);
-                    float px = SafeRead<float>(pt);
-                    float py = SafeRead<float>(pt + 4);
-                    if (fabsf(px) > 5000.f || fabsf(py) > 5000.f) continue;
-                    s.pockets[s.pocketCount++] = { px, py, i };
-                }
-            }
+        // Лунки
+        NSArray *pockets = (NSArray *)SafeMsgSend(gm, "getPockets");
+        if (!pockets || pockets.count == 0) {
+            // fallback — точки прицеливания
+            pockets = (NSArray *)SafeMsgSend(gm, "getPocketAimPoints");
         }
-    }
 
-    // Шары
-    uintptr_t bbeg = SafeRead<uintptr_t>(tbl + 0x468) & 0x0000FFFFFFFFFFFFull;
-    uintptr_t bend  = SafeRead<uintptr_t>(tbl + 0x470) & 0x0000FFFFFFFFFFFFull;
-    if (IsPtr(bbeg) && IsPtr(bend) && bend >= bbeg) {
-        uintptr_t diff = bend - bbeg;
-        if (diff <= 16 * 8) {
-            int cnt = (int)(diff / 8);
-            s.totalBalls = cnt;
+        if (pockets && pockets.count > 0) {
+            int cnt = (int)MIN(pockets.count, 6);
+            s.pocketCount = cnt;
             for (int i = 0; i < cnt; i++) {
-                uintptr_t ball = SafeRead<uintptr_t>(bbeg + (uintptr_t)i * 8) & 0x0000FFFFFFFFFFFFull;
-                if (!IsPtr(ball)) continue;
-                int st = SafeRead<int>(ball + 0xA4);
-                if (st == 1) s.pocketedBalls++;
-                else         s.activeBalls++;
+                id val = pockets[i];
+                CGPoint pt = CGPointZero;
+                @try {
+                    // NSValue содержащий CGPoint
+                    if ([val isKindOfClass:[NSValue class]])
+                        pt = [(NSValue *)val CGPointValue];
+                } @catch (...) {}
+                s.pockets[i] = { (float)pt.x, (float)pt.y, i };
+            }
+        } else {
+            snprintf(s.err, sizeof(s.err), "getPockets returned nil/empty");
+        }
+
+        // Радиус лунки
+        s.pocketRadius = (float)SafeMsgSendDouble(gm, "getPocketRadius");
+        if (s.pocketRadius < 0.1f) s.pocketRadius = 0.3f; // дефолт
+
+        // Шары — ищем метод getBalls/balls
+        NSArray *balls = (NSArray *)SafeMsgSend(gm, "getBalls");
+        if (!balls) balls = (NSArray *)SafeMsgSend(gm, "balls");
+        if (balls) {
+            s.totalBalls = (int)balls.count;
+            for (id ball in balls) {
+                @try {
+                    // метод isPocketed или state
+                    BOOL pocketed = NO;
+                    if ([ball respondsToSelector:sel_registerName("isPocketed")])
+                        pocketed = ((BOOL(*)(id,SEL))objc_msgSend)(ball, sel_registerName("isPocketed"));
+                    else if ([ball respondsToSelector:sel_registerName("pocketed")])
+                        pocketed = ((BOOL(*)(id,SEL))objc_msgSend)(ball, sel_registerName("pocketed"));
+                    if (pocketed) s.pocketedBalls++;
+                    else          s.activeBalls++;
+                } @catch (...) { s.activeBalls++; }
             }
         }
+
+        // Кий — visualCue
+        id cue = SafeMsgSend(gm, "visualCue");
+        if (cue) {
+            @try {
+                // позиция кия
+                if ([cue respondsToSelector:sel_registerName("position")]) {
+                    id posVal = SafeMsgSend(cue, "position");
+                    if (posVal && [posVal isKindOfClass:[NSValue class]]) {
+                        CGPoint p = [(NSValue*)posVal CGPointValue];
+                        s.cueX = (float)p.x;
+                        s.cueY = (float)p.y;
+                    }
+                }
+            } @catch (...) {}
+        }
+
+        // Ближайшая лунка к кию
+        for (int i = 0; i < s.pocketCount; i++) {
+            float dx = s.pockets[i].x - s.cueX;
+            float dy = s.pockets[i].y - s.cueY;
+            float d  = sqrtf(dx*dx + dy*dy);
+            if (d < s.nearestDist) { s.nearestDist = d; s.nearestIdx = i; }
+        }
+
+        s.valid = true;
+
+    } @catch (NSException *e) {
+        snprintf(s.err, sizeof(s.err), "Exception: %s", e.reason.UTF8String ?: "?");
+    } @catch (...) {
+        snprintf(s.err, sizeof(s.err), "Unknown exception");
     }
 
-    // Кий — уже прочитан выше как vc
-    if (IsPtr(vc)) {
-        s.cueX = SafeRead<float>(vc + 0x18);
-        s.cueY = SafeRead<float>(vc + 0x1C);
-    }
-
-    // Ближайшая лунка
-    for (int i = 0; i < s.pocketCount; i++) {
-        float dx = s.pockets[i].x - s.cueX;
-        float dy = s.pockets[i].y - s.cueY;
-        float d  = sqrtf(dx*dx + dy*dy);
-        if (d < s.nearestDist) { s.nearestDist = d; s.nearestIdx = i; }
-    }
-
-    s.valid = true;
     return s;
 }
 
@@ -258,27 +192,9 @@ static void DrawMenu()
         if (!gs.valid) {
             ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "Igra ne aktivna");
             ImGui::Text("err: %s", gs.err);
-            ImGui::Separator();
-            ImGui::Text("base    0x%llX", (unsigned long long)gs.dbgBase);
-            ImGui::Text("gameMgr 0x%llX", (unsigned long long)gs.dbgGM);
-            ImGui::Text("table   0x%llX", (unsigned long long)gs.dbgTbl);
-            ImGui::Text("vtable  0x%llX", (unsigned long long)SafeRead<uintptr_t>(gs.dbgGM));
-            ImGui::Separator();
-            // Все non-system образы для диагностики
-            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.3f, 1), "Images:");
-            uint32_t cnt = _dyld_image_count();
-            for (uint32_t i = 0; i < cnt; i++) {
-                const char *n = _dyld_get_image_name(i);
-                if (!n) continue;
-                if (strncmp(n, "/usr/lib", 8) == 0) continue;
-                if (strncmp(n, "/System",  7) == 0) continue;
-                if (strncmp(n, "/private/prebuilt", 17) == 0) continue;
-                uintptr_t hdr = (uintptr_t)_dyld_get_image_header(i);
-                const char *fn = strrchr(n, '/'); fn = fn ? fn+1 : n;
-                ImGui::Text("[%u] 0x%llX  %s", i, (unsigned long long)hdr, fn);
-            }
         } else {
-            ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1), "Lunok: %d", gs.pocketCount);
+            ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1),
+                "Lunok: %d  radius=%.2f", gs.pocketCount, gs.pocketRadius);
 
             if (gs.nearestIdx >= 0) {
                 ImGui::TextColored(ImVec4(1, 1, 0.3f, 1),
@@ -300,17 +216,12 @@ static void DrawMenu()
                 if (near) ImGui::PopStyleColor();
             }
             if (gs.pocketCount == 0)
-                ImGui::TextColored(ImVec4(1, 0.55f, 0, 1), "PocketButtons pust");
+                ImGui::TextColored(ImVec4(1, 0.55f, 0, 1), "getPockets = nil");
 
             ImGui::Separator();
             ImGui::Text("Shary: vsego=%d  active=%d  zabito=%d",
                 gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
             ImGui::Text("Kiy:   X=%.2f  Y=%.2f", gs.cueX, gs.cueY);
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1), "[dbg]");
-            ImGui::Text("base 0x%llX", (unsigned long long)gs.dbgBase);
-            ImGui::Text("AA   0x%llX", (unsigned long long)gs.dbgAA);
-            ImGui::Text("GM   0x%llX", (unsigned long long)gs.dbgGM);
         }
 
         ImGui::EndChild();
@@ -366,7 +277,6 @@ static void DrawMenu()
     _mtk.hidden                   = YES;
     [self addSubview:_mtk];
 
-    // ImGui — только встроенный шрифт, никаких AddFontFromFileTTF
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
@@ -374,8 +284,8 @@ static void DrawMenu()
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(1.2f);
-    io.Fonts->AddFontDefault();   // только встроенный Proggy Clean, не крашит
-    io.FontGlobalScale = 1.5f;    // увеличим чтобы было читаемо
+    io.Fonts->AddFontDefault();
+    io.FontGlobalScale = 1.5f;
 
     ImGui_ImplMetal_Init(_device);
     return self;
