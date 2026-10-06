@@ -64,13 +64,19 @@ static int ReadVectorOfPoints(id obj, const char *selName, double *outX, double 
         uintptr_t end   = vec[1];
         if (!begin || !end || end < begin) return 0;
         uintptr_t diff = end - begin;
-        int cnt = (int)(diff / 16); // каждый элемент = 16 байт (double x + double y)
+        int cnt = (int)(diff / 16);
         if (cnt <= 0 || cnt > 64) return 0;
         cnt = cnt < maxCount ? cnt : maxCount;
         for (int i = 0; i < cnt; i++) {
-            double *elem = (double *)(begin + i * 16);
-            outX[i] = elem[0];
-            outY[i] = elem[1];
+            @try {
+                double *elem = (double *)(begin + (uintptr_t)i * 16);
+                double x = elem[0];
+                double y = elem[1];
+                // Проверяем на NaN/Inf
+                if (isnan(x) || isinf(x) || isnan(y) || isinf(y)) continue;
+                outX[i] = x;
+                outY[i] = y;
+            } @catch (...) { return i; }
         }
         return cnt;
     } @catch (...) { return 0; }
@@ -146,49 +152,44 @@ static GameState ReadGameState()
         if (s.pocketRadius != s.pocketRadius || s.pocketRadius < 0.01f || s.pocketRadius > 1000.f)
             s.pocketRadius = 0.3f;
 
-        // 5. Шары — [table balls], забитый = position.x == INFINITY
+        // 5. Шары — [table balls]
+        // balls может быть NSArray или C++ vector — проверяем оба варианта
         id ballsObj = SafeMsgSend(table, "balls");
-        if (ballsObj && [ballsObj respondsToSelector:@selector(count)]) {
+        if (ballsObj &&
+            [ballsObj respondsToSelector:@selector(count)] &&
+            [ballsObj respondsToSelector:@selector(objectAtIndex:)]) {
             @try {
-                NSArray *balls = [(NSArray *)ballsObj copy];                s.totalBalls = (int)balls.count;
-                for (id ball in balls) {
-                    @try {
-                        if (![ball respondsToSelector:sel_registerName("position")]) {
-                            s.activeBalls++;
-                            continue;
-                        }
-                        CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, sel_registerName("position"));
-                        // Забитый шар имеет позицию INFINITY
-                        if (isinf(pos.x) || isinf(pos.y) || isnan(pos.x) || isnan(pos.y)) {
-                            s.pocketedBalls++;
-                            continue;
-                        }
-                        s.activeBalls++;
-                        // Белый шар (cue ball) — number=0, его позиция = позиция кия
-                        // Читаем через ivar
-                        @try {
-                            Class ballClass = object_getClass(ball);
-                            Ivar numIvar = class_getInstanceVariable(ballClass, "number");
-                            if (numIvar) {
-                                ptrdiff_t off = ivar_getOffset(numIvar);
-                                if ((off & (ptrdiff_t)0x8000000000000000LL) == 0) {
-                                    int num = *(int *)((char *)(__bridge void*)ball + off);
-                                    if (num == 0) { // белый шар
-                                        s.cueX = (float)pos.x;
-                                        s.cueY = (float)pos.y;
-                                    }
+                NSUInteger bCount = [ballsObj count];
+                if (bCount > 0 && bCount <= 32) {
+                    s.totalBalls = (int)bCount;
+                    for (NSUInteger i = 0; i < bCount; i++) {
+                        @autoreleasepool {
+                            id ball = nil;
+                            @try { ball = [ballsObj objectAtIndex:i]; } @catch (...) { s.activeBalls++; continue; }
+                            if (!ball) { s.activeBalls++; continue; }
+                            @try {
+                                if (![ball respondsToSelector:sel_registerName("position")]) {
+                                    s.activeBalls++;
+                                    continue;
                                 }
-                            }
-                        } @catch (...) {}
-                    } @catch (...) { s.activeBalls++; }
+                                CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, sel_registerName("position"));
+                                if (isinf(pos.x) || isinf(pos.y) || isnan(pos.x) || isnan(pos.y)) {
+                                    s.pocketedBalls++;
+                                } else {
+                                    s.activeBalls++;
+                                    @try {
+                                        if ([ball respondsToSelector:sel_registerName("number")]) {
+                                            int num = ((int(*)(id,SEL))objc_msgSend)(ball, sel_registerName("number"));
+                                            if (num == 0) { s.cueX = (float)pos.x; s.cueY = (float)pos.y; }
+                                        }
+                                    } @catch (...) {}
+                                }
+                            } @catch (...) { s.activeBalls++; }
+                        }
+                    }
                 }
-                // ARC освобождает balls автоматически
             } @catch (...) {}
         }
-
-        // 6. Угол прицеливания из visualCue (бонус — для будущего использования)
-        id cue = SafeMsgSend(gm, "visualCue");
-        (void)cue; // пока не используем
 
         // 7. Ближайшая лунка
         for (int i = 0; i < s.pocketCount; i++) {
