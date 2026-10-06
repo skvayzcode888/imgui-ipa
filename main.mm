@@ -25,9 +25,61 @@
 //  [table tableProperties]         -> tp         (ObjC)
 //  [tp getPockets]   -> C++ vector*: ptr[0]=begin, ptr[1]=end, ptr[2]=capacity
 //                       элемент = 16 байт (double x, double y)
-//  [tp getPocketRadius]            -> double      (ObjC)
+//  [tp getPocketRadius]            -> double      (sret через x8)
 //  [table balls]                   -> NSArray     (ObjC)
-//  [ball position]                 -> CGPoint     (ObjC selector)
+//  [ball position]                 -> CGPoint     (sret через x8)
+//
+// ============================================================
+//  Флаги фич из poolLIB.dylib (подтверждено saveSettings):
+//
+//  0x15878D  ShowTrajectory   — Enable Trajectory Overlay
+//  0x158808  ShowPrediction   — Cue Guideline
+//  0x15880A  ProjectedBalls   — Collision Trajectories
+//  0x15880B  ProjLines        — Projection Lines
+//  0x158810  AutoGame         — Shot Assist (авто-прицел)
+// ============================================================
+
+// База poolLIB.dylib в памяти — ищем по имени
+static uintptr_t g_poolLibBase = 0;
+
+static uintptr_t GetPoolLibBase()
+{
+    if (g_poolLibBase) return g_poolLibBase;
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        const char *fname = strrchr(path, '/');
+        fname = fname ? fname + 1 : path;
+        if (strcmp(fname, "poolLIB.dylib") == 0) {
+            g_poolLibBase = (uintptr_t)_dyld_get_image_header(i);
+            return g_poolLibBase;
+        }
+    }
+    return 0;
+}
+
+// Читаем/пишем bool флаг в poolLIB по file offset
+static bool GetFlag(uintptr_t offset)
+{
+    uintptr_t base = GetPoolLibBase();
+    if (!base) return false;
+    return *(volatile bool *)(base + offset);
+}
+
+static void SetFlag(uintptr_t offset, bool val)
+{
+    uintptr_t base = GetPoolLibBase();
+    if (!base) return;
+    *(volatile bool *)(base + offset) = val;
+}
+
+// Офсеты флагов (из saveSettings poolLIB.dylib, imagebase=0)
+#define FLAG_TRAJECTORY  0x15878DUL   // ShowTrajectory
+#define FLAG_CUE_GUIDE   0x158808UL   // ShowPrediction (Cue Guideline)
+#define FLAG_COLLISION   0x15880AUL   // ProjectedBalls (Collision Trajectories)
+#define FLAG_PROJ_LINES  0x15880BUL   // ProjLines (Projection Lines)
+#define FLAG_AUTOGAME    0x158810UL   // AutoGame (Shot Assist)
 //  ball.number                     -> int ivar    (class_getInstanceVariable)
 //  забитый шар: isfinite(pos.x)==false
 // ============================================================
@@ -246,6 +298,31 @@ static void DrawMenu()
     ImGui::Begin("crown.pw");
 
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
+    ImGui::Separator();
+
+    // ---- Trajectory ----
+    {
+        bool traj = GetFlag(FLAG_TRAJECTORY);
+        if (ImGui::Checkbox("Enable Trajectory Overlay", &traj))
+            SetFlag(FLAG_TRAJECTORY, traj);
+
+        bool guide = GetFlag(FLAG_CUE_GUIDE);
+        if (ImGui::Checkbox("Cue Guideline", &guide))
+            SetFlag(FLAG_CUE_GUIDE, guide);
+
+        bool coll = GetFlag(FLAG_COLLISION);
+        if (ImGui::Checkbox("Collision Trajectory", &coll))
+            SetFlag(FLAG_COLLISION, coll);
+
+        bool proj = GetFlag(FLAG_PROJ_LINES);
+        if (ImGui::Checkbox("Projection Line", &proj))
+            SetFlag(FLAG_PROJ_LINES, proj);
+
+        bool autog = GetFlag(FLAG_AUTOGAME);
+        if (ImGui::Checkbox("Shot Assist (AutoGame)", &autog))
+            SetFlag(FLAG_AUTOGAME, autog);
+    }
+
     ImGui::Separator();
     ImGui::Checkbox("Lunki / Shary", &g_showPockets);
 
