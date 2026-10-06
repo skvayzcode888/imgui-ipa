@@ -18,21 +18,21 @@
 #include <string.h>
 
 // ============================================================
-//  Всё проверено по дизасму poolLIB.dylib:
+//  Проверено по дизасму poolLIB.dylib (game_loop_main_logic):
 //
-//  1. [GameManager sharedGameManager] -> gm
-//  2. [gm table]                      -> table (NSArray balls, tableProperties)
-//  3. [table tableProperties]         -> tableProps
-//  4. [tableProps getPockets]         -> C++ vector<double2> (begin/end ptrs)
-//  5. [tableProps getPocketRadius]    -> double
-//  6. [table balls]                   -> NSArray шаров
-//  7. [ball position]                 -> selector, CGPoint (два double)
-//     if fabs(x) == INF -> шар забит  (подтверждено в дизасме 0x17bd8)
-//  8. ball.number                     -> ivar (class_getInstanceVariable + ivar_getOffset + LDR W)
+//  [GameManager sharedGameManager] -> gm        (ObjC)
+//  [gm table]                      -> table      (ObjC)
+//  [table tableProperties]         -> tp         (ObjC)
+//  [tp getPockets]   -> C++ vector*: ptr[0]=begin, ptr[1]=end, ptr[2]=capacity
+//                       элемент = 16 байт (double x, double y)
+//  [tp getPocketRadius]            -> double      (ObjC)
+//  [table balls]                   -> NSArray     (ObjC)
+//  [ball position]                 -> CGPoint     (ObjC selector)
+//  ball.number                     -> int ivar    (class_getInstanceVariable)
+//  забитый шар: isfinite(pos.x)==false
 // ============================================================
 
-// --- Helpers ---
-
+// SafeCall — для нормальных ObjC методов возвращающих id
 static id SafeCall(id obj, const char *sel_name)
 {
     if (!obj) return nil;
@@ -49,7 +49,7 @@ static double SafeCallDouble(id obj, const char *sel_name)
     return ((double(*)(id,SEL))objc_msgSend)(obj, s);
 }
 
-// number через ivar — именно как в дизасме 0x17db8
+// number через ivar — подтверждено дизасмом 0x17db8
 static int BallNumber(id ball)
 {
     if (!ball) return -1;
@@ -62,27 +62,34 @@ static int BallNumber(id ball)
     return *(int *)((uint8_t *)(__bridge void *)ball + off);
 }
 
-// getPockets возвращает C++ vector-like объект: ptr[0]=begin, ptr[1]=end
-// каждый элемент = 16 байт (double x, double y) — подтверждено в sub_2079C
-static int ReadPockets(id tableProps, double *outX, double *outY, int maxN)
-{
-    if (!tableProps) return 0;
+// getPockets возвращает C++ vector (НЕ ObjC объект).
+// Дизасм 0x20810: X0 = msgSend result, LDR X9,[X0] = begin, LDR X10,[X0,#8] = end
+// typedef чтобы ARC не делал retain/release
+typedef uintptr_t *(*RawPtrFn)(id, SEL);
 
-    // Пробуем getPockets, fallback getPocketAimPoints
+static int ReadPockets(id tp, double *outX, double *outY, int maxN)
+{
+    if (!tp) return 0;
+
     const char *names[] = { "getPockets", "getPocketAimPoints", nullptr };
     for (int ni = 0; names[ni]; ni++) {
         SEL s = sel_registerName(names[ni]);
-        if (![tableProps respondsToSelector:s]) continue;
+        if (![tp respondsToSelector:s]) continue;
 
-        uintptr_t *vec = (uintptr_t *)((uintptr_t(*)(id,SEL))objc_msgSend)(tableProps, s);
+        // Вызов без ARC retain/release
+        uintptr_t *vec = ((RawPtrFn)objc_msgSend)(tp, s);
         if (!vec) continue;
 
+        // Проверяем валидность указателей begin/end перед чтением
         uintptr_t begin = vec[0];
         uintptr_t end   = vec[1];
-        if (!begin || !end || end <= begin) continue;
+
+        // begin и end должны быть в разумном диапазоне userspace arm64
+        if (begin < 0x100000000ULL || end < 0x100000000ULL) continue;
+        if (end <= begin) continue;
 
         uintptr_t diff = end - begin;
-        // Санити: 1..6 лунок по 16 байт = 16..96
+        // 1..6 лунок * 16 байт
         if (diff < 16 || diff > 96) continue;
 
         int cnt = (int)(diff / 16);
@@ -132,14 +139,12 @@ static GameState ReadGameState()
     s.nearestDist = 1e9f;
 
     @try {
-
         id gm = GetGameManager();
         if (!gm) { snprintf(s.err, sizeof(s.err), "no GameManager"); return s; }
 
         id table = SafeCall(gm, "table");
         if (!table) { snprintf(s.err, sizeof(s.err), "table=nil"); return s; }
 
-        // tableProperties — там getPockets и getPocketRadius
         id tp = SafeCall(table, "tableProperties");
         if (!tp) { snprintf(s.err, sizeof(s.err), "tableProperties=nil"); return s; }
 
@@ -154,14 +159,14 @@ static GameState ReadGameState()
         double r = SafeCallDouble(tp, "getPocketRadius");
         s.pocketRadius = (r > 0.01 && r < 1000.0 && r == r) ? (float)r : 0.3f;
 
-        // Шары — [table balls] -> NSArray (подтверждено: count + objectAtIndex:)
+        // Шары
         id ballsArr = SafeCall(table, "balls");
         if (ballsArr &&
             [ballsArr respondsToSelector:@selector(count)] &&
             [ballsArr respondsToSelector:@selector(objectAtIndex:)])
         {
             NSUInteger n = [ballsArr count];
-            if (n <= 32) {
+            if (n > 0 && n <= 32) {
                 s.totalBalls = (int)n;
                 for (NSUInteger i = 0; i < n; i++) {
                     id ball = [ballsArr objectAtIndex:i];
@@ -170,17 +175,14 @@ static GameState ReadGameState()
                     SEL posSel = sel_registerName("position");
                     if (![ball respondsToSelector:posSel]) { s.activeBalls++; continue; }
 
-                    // position возвращает CGPoint (два double) — подтверждено дизасмом 0x17b84
                     CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, posSel);
 
-                    // Забитый шар = INFINITY — подтверждено 0x17bd4-0x17bd8
                     if (!isfinite(pos.x) || !isfinite(pos.y)) {
                         s.pocketedBalls++;
                         continue;
                     }
                     s.activeBalls++;
 
-                    // Белый шар: number ivar == 0 — подтверждено 0x17db8
                     if (BallNumber(ball) == 0) {
                         s.cueX = (float)pos.x;
                         s.cueY = (float)pos.y;
@@ -189,7 +191,6 @@ static GameState ReadGameState()
             }
         }
 
-        // Ближайшая лунка к белому шару
         for (int i = 0; i < s.pocketCount; i++) {
             float dx = s.pockets[i].x - s.cueX;
             float dy = s.pockets[i].y - s.cueY;
@@ -209,21 +210,34 @@ static GameState ReadGameState()
 }
 
 // ============================================================
-//  Кешированный game state — обновляется на main thread,
-//  рендер читает без гонки
+//  Кеш — обновляется на main thread каждые 200мс,
+//  только когда меню открыто
 // ============================================================
 
-static GameState g_cachedState = {};
-static bool      g_stateReady  = false;
+static GameState g_state    = {};
+static bool      g_stateOk  = false;
+static bool      g_menuOpen = false;
 
-static void UpdateGameState()
+static void ScheduleUpdate();
+
+static void DoUpdate()
 {
-    g_cachedState = ReadGameState();
-    g_stateReady  = true;
-    // Повторяем каждые 100мс — достаточно для отображения
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{ UpdateGameState(); });
+    if (g_menuOpen) {
+        g_state   = ReadGameState();
+        g_stateOk = true;
+    }
+    ScheduleUpdate();
 }
+
+static void ScheduleUpdate()
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ DoUpdate(); });
+}
+
+// ============================================================
+//  Menu
+// ============================================================
 
 static bool g_showPockets = false;
 static bool g_demoWindow  = false;
@@ -243,17 +257,17 @@ static void DrawMenu()
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.13f, 0.95f));
         ImGui::BeginChild("##pk", ImVec2(0, 0), true);
 
-        GameState gs = g_stateReady ? g_cachedState : GameState{};
+        GameState &gs = g_state;
 
-        if (!g_stateReady || !gs.valid) {
-            ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Not in match");
-            if (g_stateReady) ImGui::Text("err: %s", gs.err);
+        if (!g_stateOk || !gs.valid) {
+            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Not in match");
+            if (g_stateOk) ImGui::Text("err: %s", gs.err);
         } else {
-            ImGui::TextColored(ImVec4(0.4f,1,0.4f,1),
+            ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1),
                 "Lunok: %d  r=%.2f", gs.pocketCount, gs.pocketRadius);
 
             if (gs.nearestIdx >= 0) {
-                ImGui::TextColored(ImVec4(1,1,0.3f,1),
+                ImGui::TextColored(ImVec4(1, 1, 0.3f, 1),
                     "Blizh #%d  dist=%.1f", gs.nearestIdx, gs.nearestDist);
                 ImGui::Text("  X=%.2f  Y=%.2f",
                     gs.pockets[gs.nearestIdx].x,
@@ -263,7 +277,7 @@ static void DrawMenu()
             ImGui::Separator();
             for (int i = 0; i < gs.pocketCount; i++) {
                 bool near = (i == gs.nearestIdx);
-                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,0.3f,1));
+                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 0.3f, 1));
                 ImGui::Text("[%d] X=%.1f  Y=%.1f%s",
                     i, gs.pockets[i].x, gs.pockets[i].y, near ? " <--" : "");
                 if (near) ImGui::PopStyleColor();
@@ -308,7 +322,7 @@ static void DrawMenu()
 
     self.backgroundColor  = UIColor.clearColor;
     self.opaque           = NO;
-    self.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.multipleTouchEnabled = YES;
 
     _device = MTLCreateSystemDefaultDevice();
@@ -317,9 +331,9 @@ static void DrawMenu()
 
     _mtk = [[MTKView alloc] initWithFrame:self.bounds device:_device];
     _mtk.delegate                 = self;
-    _mtk.autoresizingMask         = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+    _mtk.autoresizingMask         = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _mtk.colorPixelFormat         = MTLPixelFormatBGRA8Unorm;
-    _mtk.clearColor               = MTLClearColorMake(0,0,0,0);
+    _mtk.clearColor               = MTLClearColorMake(0, 0, 0, 0);
     _mtk.backgroundColor          = UIColor.clearColor;
     _mtk.opaque                   = NO;
     _mtk.layer.opaque             = NO;
@@ -346,8 +360,14 @@ static void DrawMenu()
 - (void)toggleMenu
 {
     self.menuOpen = !self.menuOpen;
+    g_menuOpen    = self.menuOpen;
     _mtk.hidden   = !self.menuOpen;
     _mtk.paused   = !self.menuOpen;
+    // При открытии меню — сбросить кеш чтобы сразу показать свежие данные
+    if (self.menuOpen) {
+        g_stateOk = false;
+        dispatch_async(dispatch_get_main_queue(), ^{ DoUpdate(); });
+    }
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)event
@@ -358,44 +378,44 @@ static void DrawMenu()
     for (ImGuiWindow *w : ctx->Windows)
         if (w->Active && !w->Hidden &&
             !(w->Flags & ImGuiWindowFlags_NoInputs) &&
-            w->Rect().Contains(ImVec2((float)p.x,(float)p.y)))
+            w->Rect().Contains(ImVec2((float)p.x, (float)p.y)))
             return self;
     return nil;
 }
 
-- (void)feed:(NSSet<UITouch*>*)touches down:(BOOL)down
+- (void)feed:(NSSet<UITouch *> *)touches down:(BOOL)down
 {
     UITouch *t = touches.anyObject;
     if (!t) return;
     CGPoint p = [t locationInView:self];
     ImGuiIO &io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    io.AddMousePosEvent((float)p.x,(float)p.y);
+    io.AddMousePosEvent((float)p.x, (float)p.y);
     io.AddMouseButtonEvent(0, down);
 }
--(void)touchesBegan:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:YES]; }
--(void)touchesMoved:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:YES]; }
--(void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e     { [self feed:t down:NO];  }
--(void)touchesCancelled:(NSSet*)t withEvent:(UIEvent*)e { [self feed:t down:NO];  }
--(void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)s {}
+- (void)touchesBegan:(NSSet *)t withEvent:(UIEvent *)e      { [self feed:t down:YES]; }
+- (void)touchesMoved:(NSSet *)t withEvent:(UIEvent *)e      { [self feed:t down:YES]; }
+- (void)touchesEnded:(NSSet *)t withEvent:(UIEvent *)e      { [self feed:t down:NO];  }
+- (void)touchesCancelled:(NSSet *)t withEvent:(UIEvent *)e  { [self feed:t down:NO];  }
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)s {}
 
--(void)drawInMTKView:(MTKView*)view
+- (void)drawInMTKView:(MTKView *)view
 {
     CGSize b = view.bounds.size;
     CGSize d = view.drawableSize;
     if (b.width <= 0 || b.height <= 0) return;
 
     ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize             = ImVec2((float)b.width,(float)b.height);
-    io.DisplayFramebufferScale = ImVec2((float)(d.width/b.width),(float)(d.height/b.height));
+    io.DisplaySize             = ImVec2((float)b.width, (float)b.height);
+    io.DisplayFramebufferScale = ImVec2((float)(d.width / b.width), (float)(d.height / b.height));
 
     static CFTimeInterval last = 0;
     CFTimeInterval now = CACurrentMediaTime();
-    io.DeltaTime = (last > 0) ? (float)(now-last) : 1.f/60.f;
-    if (io.DeltaTime <= 0) io.DeltaTime = 1.f/60.f;
+    io.DeltaTime = (last > 0) ? (float)(now - last) : 1.f / 60.f;
+    if (io.DeltaTime <= 0) io.DeltaTime = 1.f / 60.f;
     last = now;
 
-    id<MTLCommandBuffer> cb = [self.queue commandBuffer];
+    id<MTLCommandBuffer>     cb  = [self.queue commandBuffer];
     MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
     if (!rpd) { [cb commit]; return; }
 
@@ -438,7 +458,7 @@ static void TryInstall(int attempt)
     if (!w || !w.rootViewController.view) {
         if (attempt < 60)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{ TryInstall(attempt+1); });
+                           dispatch_get_main_queue(), ^{ TryInstall(attempt + 1); });
         return;
     }
     if (g_overlay) return;
@@ -447,8 +467,9 @@ static void TryInstall(int attempt)
     if (!g_overlay) return;
     [w addSubview:g_overlay];
 
-    // Запускаем обновление game state на main thread каждые 100мс
-    UpdateGameState();
+    // Запускаем цикл обновления — но DoUpdate проверяет g_menuOpen
+    // и ничего не делает пока меню закрыто
+    ScheduleUpdate();
 
     UITapGestureRecognizer *gr =
         [[UITapGestureRecognizer alloc] initWithTarget:g_overlay action:@selector(toggleMenu)];
