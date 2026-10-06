@@ -20,15 +20,17 @@
 // ============================================================
 //  GameManager через ObjC runtime (реверс рабочего мода poolLIB.dylib)
 //
-//  Методы GameManager:
-//    +sharedGameManager   -> id  (синглтон)
-//    -getPockets          -> NSArray<NSValue*> (CGPoint каждой лунки)
-//    -getPocketAimPoints  -> NSArray<NSValue*> (CGPoint точек прицеливания)
-//    -getPocketRadius     -> double
-//    -visualCue           -> id (объект кия)
+//  Цепочка:
+//    objc_getClass("GameManager") -> Class
+//    [Class sharedGameManager]    -> id gm
+//    [gm table]                   -> id table (объект стола)
+//    [table getPockets]           -> C++ vector-like: ptr[0]=begin, ptr[1]=end
+//                                    каждый элемент = 16 байт (double x, double y)
+//    [table balls]                -> аналогично, элементы = ball объекты
+//    [table getPocketRadius]      -> double
+//    [gm visualCue]               -> id cue
 // ============================================================
 
-// Безопасный вызов ObjC метода — возвращает nil если класс/метод не существует
 static id SafeMsgSend(id obj, const char *selName)
 {
     if (!obj) return nil;
@@ -45,12 +47,42 @@ static double SafeMsgSendDouble(id obj, const char *selName)
     return ((double(*)(id,SEL))objc_msgSend)(obj, sel);
 }
 
+// Читаем C++ vector-like структуру: ptr[0]=begin, ptr[1]=end, элемент=16 байт (double x,y)
+// Возвращает количество точек, заполняет out[] (макс maxCount)
+static int ReadVectorOfPoints(id obj, const char *selName, double *outX, double *outY, int maxCount)
+{
+    if (!obj) return 0;
+    SEL sel = sel_registerName(selName);
+    if (![obj respondsToSelector:sel]) return 0;
+
+    // Возвращает указатель на C++ vector-like структуру
+    uintptr_t *vec = (uintptr_t *)((uintptr_t(*)(id,SEL))objc_msgSend)(obj, sel);
+    if (!vec) return 0;
+
+    @try {
+        uintptr_t begin = vec[0];
+        uintptr_t end   = vec[1];
+        if (!begin || !end || end < begin) return 0;
+        uintptr_t diff = end - begin;
+        int cnt = (int)(diff / 16); // каждый элемент = 16 байт (double x + double y)
+        if (cnt <= 0 || cnt > 64) return 0;
+        cnt = cnt < maxCount ? cnt : maxCount;
+        for (int i = 0; i < cnt; i++) {
+            double *elem = (double *)(begin + i * 16);
+            outX[i] = elem[0];
+            outY[i] = elem[1];
+        }
+        return cnt;
+    } @catch (...) { return 0; }
+}
+
 static id GetGameManager()
 {
     Class cls = objc_getClass("GameManager");
     if (!cls) return nil;
-    if (![cls respondsToSelector:sel_registerName("sharedGameManager")]) return nil;
-    return ((id(*)(id,SEL))objc_msgSend)((id)cls, sel_registerName("sharedGameManager"));
+    SEL sel = sel_registerName("sharedGameManager");
+    if (![cls respondsToSelector:sel]) return nil;
+    return ((id(*)(id,SEL))objc_msgSend)((id)cls, sel);
 }
 
 // ============================================================
@@ -77,48 +109,41 @@ static GameState ReadGameState()
     s.nearestDist = 1e9f;
 
     @try {
+        // 1. GameManager синглтон
         id gm = GetGameManager();
         if (!gm) {
-            snprintf(s.err, sizeof(s.err), "GameManager not found");
+            snprintf(s.err, sizeof(s.err), "GameManager class not found");
             return s;
         }
 
-        // Лунки
-        NSArray *pockets = (NSArray *)SafeMsgSend(gm, "getPockets");
-        if (!pockets || pockets.count == 0) {
-            // fallback — точки прицеливания
-            pockets = (NSArray *)SafeMsgSend(gm, "getPocketAimPoints");
+        // 2. Table объект
+        id table = SafeMsgSend(gm, "table");
+        if (!table) {
+            snprintf(s.err, sizeof(s.err), "gm.table = nil (not in match?)");
+            return s;
         }
 
-        if (pockets && pockets.count > 0) {
-            int cnt = (int)MIN(pockets.count, 6);
-            s.pocketCount = cnt;
-            for (int i = 0; i < cnt; i++) {
-                id val = pockets[i];
-                CGPoint pt = CGPointZero;
-                @try {
-                    // NSValue содержащий CGPoint
-                    if ([val isKindOfClass:[NSValue class]])
-                        pt = [(NSValue *)val CGPointValue];
-                } @catch (...) {}
-                s.pockets[i] = { (float)pt.x, (float)pt.y, i };
-            }
-        } else {
-            snprintf(s.err, sizeof(s.err), "getPockets returned nil/empty");
-        }
+        // 3. Лунки — getPockets на table, возвращает C++ vector<CGPoint/double2>
+        double pxArr[6], pyArr[6];
+        int cnt = ReadVectorOfPoints(table, "getPockets", pxArr, pyArr, 6);
+        if (cnt == 0)
+            cnt = ReadVectorOfPoints(table, "getPocketAimPoints", pxArr, pyArr, 6);
 
-        // Радиус лунки
-        s.pocketRadius = (float)SafeMsgSendDouble(gm, "getPocketRadius");
-        if (s.pocketRadius < 0.1f) s.pocketRadius = 0.3f; // дефолт
+        s.pocketCount = cnt;
+        for (int i = 0; i < cnt; i++)
+            s.pockets[i] = { (float)pxArr[i], (float)pyArr[i], i };
 
-        // Шары — ищем метод getBalls/balls
-        NSArray *balls = (NSArray *)SafeMsgSend(gm, "getBalls");
-        if (!balls) balls = (NSArray *)SafeMsgSend(gm, "balls");
-        if (balls) {
+        // 4. Радиус лунки
+        s.pocketRadius = (float)SafeMsgSendDouble(table, "getPocketRadius");
+        if (s.pocketRadius < 0.01f) s.pocketRadius = 0.3f;
+
+        // 5. Шары — [table balls]
+        id ballsObj = SafeMsgSend(table, "balls");
+        if (ballsObj && [ballsObj respondsToSelector:@selector(count)]) {
+            NSArray *balls = (NSArray *)ballsObj;
             s.totalBalls = (int)balls.count;
             for (id ball in balls) {
                 @try {
-                    // метод isPocketed или state
                     BOOL pocketed = NO;
                     if ([ball respondsToSelector:sel_registerName("isPocketed")])
                         pocketed = ((BOOL(*)(id,SEL))objc_msgSend)(ball, sel_registerName("isPocketed"));
@@ -130,23 +155,20 @@ static GameState ReadGameState()
             }
         }
 
-        // Кий — visualCue
+        // 6. Позиция кия — [gm visualCue] -> position
         id cue = SafeMsgSend(gm, "visualCue");
         if (cue) {
             @try {
-                // позиция кия
+                // Пробуем CGPoint position
                 if ([cue respondsToSelector:sel_registerName("position")]) {
-                    id posVal = SafeMsgSend(cue, "position");
-                    if (posVal && [posVal isKindOfClass:[NSValue class]]) {
-                        CGPoint p = [(NSValue*)posVal CGPointValue];
-                        s.cueX = (float)p.x;
-                        s.cueY = (float)p.y;
-                    }
+                    CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(cue, sel_registerName("position"));
+                    s.cueX = (float)pos.x;
+                    s.cueY = (float)pos.y;
                 }
             } @catch (...) {}
         }
 
-        // Ближайшая лунка к кию
+        // 7. Ближайшая лунка
         for (int i = 0; i < s.pocketCount; i++) {
             float dx = s.pockets[i].x - s.cueX;
             float dy = s.pockets[i].y - s.cueY;
