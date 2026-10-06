@@ -32,7 +32,7 @@
 //  забитый шар: isfinite(pos.x)==false
 // ============================================================
 
-// SafeCall — для нормальных ObjC методов возвращающих id
+// SafeCall — обычный, без __unsafe_unretained
 static id SafeCall(id obj, const char *sel_name)
 {
     if (!obj) return nil;
@@ -58,7 +58,7 @@ static int BallNumber(id ball)
     Ivar iv = class_getInstanceVariable(cls, "number");
     if (!iv) return -1;
     ptrdiff_t off = ivar_getOffset(iv);
-    if (off <= 0) return -1;
+    if (off < 0) return -1;
     return *(int *)((uint8_t *)(__bridge void *)ball + off);
 }
 
@@ -210,38 +210,11 @@ static GameState ReadGameState()
 }
 
 // ============================================================
-//  Кеш — обновляется на main thread каждые 200мс,
-//  только когда меню открыто
-// ============================================================
-
-static GameState g_state    = {};
-static bool      g_stateOk  = false;
-static bool      g_menuOpen = false;
-
-static void ScheduleUpdate();
-
-static void DoUpdate()
-{
-    if (g_menuOpen) {
-        g_state   = ReadGameState();
-        g_stateOk = true;
-    }
-    ScheduleUpdate();
-}
-
-static void ScheduleUpdate()
-{
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{ DoUpdate(); });
-}
-
-// ============================================================
 //  Menu
 // ============================================================
 
 static bool g_showPockets = false;
 static bool g_demoWindow  = false;
-
 static void DrawMenu()
 {
     ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
@@ -254,43 +227,8 @@ static void DrawMenu()
 
     if (g_showPockets) {
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.13f, 0.95f));
-        ImGui::BeginChild("##pk", ImVec2(0, 0), true);
-
-        GameState &gs = g_state;
-
-        if (!g_stateOk || !gs.valid) {
-            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Not in match");
-            if (g_stateOk) ImGui::Text("err: %s", gs.err);
-        } else {
-            ImGui::TextColored(ImVec4(0.4f, 1, 0.4f, 1),
-                "Lunok: %d  r=%.2f", gs.pocketCount, gs.pocketRadius);
-
-            if (gs.nearestIdx >= 0) {
-                ImGui::TextColored(ImVec4(1, 1, 0.3f, 1),
-                    "Blizh #%d  dist=%.1f", gs.nearestIdx, gs.nearestDist);
-                ImGui::Text("  X=%.2f  Y=%.2f",
-                    gs.pockets[gs.nearestIdx].x,
-                    gs.pockets[gs.nearestIdx].y);
-            }
-
-            ImGui::Separator();
-            for (int i = 0; i < gs.pocketCount; i++) {
-                bool near = (i == gs.nearestIdx);
-                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 0.3f, 1));
-                ImGui::Text("[%d] X=%.1f  Y=%.1f%s",
-                    i, gs.pockets[i].x, gs.pockets[i].y, near ? " <--" : "");
-                if (near) ImGui::PopStyleColor();
-            }
-
-            ImGui::Separator();
-            ImGui::Text("Shary: %d  active=%d  zabito=%d",
-                gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
-            ImGui::Text("Kiy:  X=%.1f  Y=%.1f", gs.cueX, gs.cueY);
-        }
-
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
+        ImGui::Text("TEST: game state disabled");
+        // ReadGameState временно отключён для диагностики
     }
 
     ImGui::Separator();
@@ -360,14 +298,8 @@ static void DrawMenu()
 - (void)toggleMenu
 {
     self.menuOpen = !self.menuOpen;
-    g_menuOpen    = self.menuOpen;
     _mtk.hidden   = !self.menuOpen;
     _mtk.paused   = !self.menuOpen;
-    // При открытии меню — сбросить кеш чтобы сразу показать свежие данные
-    if (self.menuOpen) {
-        g_stateOk = false;
-        dispatch_async(dispatch_get_main_queue(), ^{ DoUpdate(); });
-    }
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)event
@@ -466,10 +398,6 @@ static void TryInstall(int attempt)
     g_overlay = [[OverlayView alloc] initWithFrame:w.bounds];
     if (!g_overlay) return;
     [w addSubview:g_overlay];
-
-    // Запускаем цикл обновления — но DoUpdate проверяет g_menuOpen
-    // и ничего не делает пока меню закрыто
-    ScheduleUpdate();
 
     UITapGestureRecognizer *gr =
         [[UITapGestureRecognizer alloc] initWithTarget:g_overlay action:@selector(toggleMenu)];
