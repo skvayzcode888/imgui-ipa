@@ -209,8 +209,21 @@ static GameState ReadGameState()
 }
 
 // ============================================================
-//  Menu
+//  Кешированный game state — обновляется на main thread,
+//  рендер читает без гонки
 // ============================================================
+
+static GameState g_cachedState = {};
+static bool      g_stateReady  = false;
+
+static void UpdateGameState()
+{
+    g_cachedState = ReadGameState();
+    g_stateReady  = true;
+    // Повторяем каждые 100мс — достаточно для отображения
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ UpdateGameState(); });
+}
 
 static bool g_showPockets = false;
 static bool g_demoWindow  = false;
@@ -230,11 +243,11 @@ static void DrawMenu()
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.13f, 0.95f));
         ImGui::BeginChild("##pk", ImVec2(0, 0), true);
 
-        GameState gs = ReadGameState();
+        GameState gs = g_stateReady ? g_cachedState : GameState{};
 
-        if (!gs.valid) {
+        if (!g_stateReady || !gs.valid) {
             ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Not in match");
-            ImGui::Text("err: %s", gs.err);
+            if (g_stateReady) ImGui::Text("err: %s", gs.err);
         } else {
             ImGui::TextColored(ImVec4(0.4f,1,0.4f,1),
                 "Lunok: %d  r=%.2f", gs.pocketCount, gs.pocketRadius);
@@ -433,6 +446,9 @@ static void TryInstall(int attempt)
     g_overlay = [[OverlayView alloc] initWithFrame:w.bounds];
     if (!g_overlay) return;
     [w addSubview:g_overlay];
+
+    // Запускаем обновление game state на main thread каждые 100мс
+    UpdateGameState();
 
     UITapGestureRecognizer *gr =
         [[UITapGestureRecognizer alloc] initWithTarget:g_overlay action:@selector(toggleMenu)];
