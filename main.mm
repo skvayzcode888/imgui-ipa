@@ -230,20 +230,40 @@ static void DrawMenu()
 
         id gm = GetGameManager();
         if (!gm) { ImGui::Text("GameManager: nil"); goto end_pk; }
-        ImGui::Text("GM: OK 0x%llX", (unsigned long long)(__bridge void*)gm);
 
         {
             id table = SafeCall(gm, "table");
             if (!table) { ImGui::Text("table: nil"); goto end_pk; }
-            ImGui::Text("table: OK 0x%llX", (unsigned long long)(__bridge void*)table);
 
             id tp = SafeCall(table, "tableProperties");
             if (!tp) { ImGui::Text("tableProps: nil"); goto end_pk; }
-            ImGui::Text("tableProps: OK 0x%llX", (unsigned long long)(__bridge void*)tp);
 
-            id balls = SafeCall(table, "balls");
-            if (!balls) ImGui::Text("balls: nil");
-            else        ImGui::Text("balls: OK count=%d", (int)[balls count]);
+            // getPockets
+            double px[6]={}, py[6]={};
+            int cnt = ReadPockets(tp, px, py, 6);
+            ImGui::Text("pockets: %d", cnt);
+            for (int i = 0; i < cnt; i++)
+                ImGui::Text("  [%d] X=%.1f Y=%.1f", i, (float)px[i], (float)py[i]);
+
+            // balls + position
+            id ballsArr = SafeCall(table, "balls");
+            if (!ballsArr) { ImGui::Text("balls: nil"); goto end_pk; }
+            NSUInteger n = [ballsArr count];
+            ImGui::Text("balls: %d", (int)n);
+            int active=0, pocketed=0;
+            float cueX=0, cueY=0;
+            for (NSUInteger i = 0; i < n && i < 32; i++) {
+                id ball = [ballsArr objectAtIndex:i];
+                if (!ball) continue;
+                SEL ps = sel_registerName("position");
+                if (![ball respondsToSelector:ps]) continue;
+                CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, ps);
+                if (!isfinite(pos.x) || !isfinite(pos.y)) { pocketed++; continue; }
+                active++;
+                if (BallNumber(ball) == 0) { cueX=(float)pos.x; cueY=(float)pos.y; }
+            }
+            ImGui::Text("active=%d pocketed=%d", active, pocketed);
+            ImGui::Text("cue X=%.1f Y=%.1f", cueX, cueY);
         }
         end_pk:;
     }
