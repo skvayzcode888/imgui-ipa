@@ -140,24 +140,27 @@ static GameState ReadGameState()
         return s;
     }
 
-    // Проверяем что vtable читается — первые 8 байт должны быть указателем
-    uintptr_t vtbl = SafeRead<uintptr_t>(gm);
+    // Проверяем что vtable читается — маскируем PAC биты (arm64e)
+    uintptr_t vtbl = SafeRead<uintptr_t>(gm) & 0x0000FFFFFFFFFFFFull;
     if (!IsPtr(vtbl)) {
-        snprintf(s.err, sizeof(s.err), "GM vtable=0, not initialized yet");
+        snprintf(s.err, sizeof(s.err), "GM not initialized yet");
         return s;
     }
 
-    // Table* — читаем как pointer из GameManager+0x400
-    uintptr_t tbl = SafeRead<uintptr_t>(gm + 0x400);
+    // Table* — читаем как pointer из GameManager+0x400, снимаем PAC
+    uintptr_t tbl = SafeRead<uintptr_t>(gm + 0x400) & 0x0000FFFFFFFFFFFFull;
     s.dbgTbl = tbl;
     if (!IsPtr(tbl)) {
-        snprintf(s.err, sizeof(s.err), "Table=0 (GM not in game yet?)");
+        snprintf(s.err, sizeof(s.err), "Table=0 (enter a match first)");
         return s;
     }
 
-    // Лунки — mPocketNominationButtons
-    uintptr_t pkBeg = SafeRead<uintptr_t>(gm + 0x720);
-    uintptr_t pkEnd = SafeRead<uintptr_t>(gm + 0x728);
+    // VisualCue*
+    uintptr_t vc = SafeRead<uintptr_t>(gm + 0x4D0) & 0x0000FFFFFFFFFFFFull;
+
+    // mPocketNominationButtons vector
+    uintptr_t pkBeg = SafeRead<uintptr_t>(gm + 0x720) & 0x0000FFFFFFFFFFFFull;
+    uintptr_t pkEnd = SafeRead<uintptr_t>(gm + 0x728) & 0x0000FFFFFFFFFFFFull;
     if (IsPtr(pkBeg) && IsPtr(pkEnd) && pkEnd >= pkBeg) {
         uintptr_t diff = pkEnd - pkBeg;
         if (diff > 0 && diff <= 6 * 8) {
@@ -193,15 +196,15 @@ static GameState ReadGameState()
     }
 
     // Шары
-    uintptr_t bbeg = SafeRead<uintptr_t>(tbl + 0x468);
-    uintptr_t bend = SafeRead<uintptr_t>(tbl + 0x470);
+    uintptr_t bbeg = SafeRead<uintptr_t>(tbl + 0x468) & 0x0000FFFFFFFFFFFFull;
+    uintptr_t bend  = SafeRead<uintptr_t>(tbl + 0x470) & 0x0000FFFFFFFFFFFFull;
     if (IsPtr(bbeg) && IsPtr(bend) && bend >= bbeg) {
         uintptr_t diff = bend - bbeg;
         if (diff <= 16 * 8) {
             int cnt = (int)(diff / 8);
             s.totalBalls = cnt;
             for (int i = 0; i < cnt; i++) {
-                uintptr_t ball = SafeRead<uintptr_t>(bbeg + (uintptr_t)i * 8);
+                uintptr_t ball = SafeRead<uintptr_t>(bbeg + (uintptr_t)i * 8) & 0x0000FFFFFFFFFFFFull;
                 if (!IsPtr(ball)) continue;
                 int st = SafeRead<int>(ball + 0xA4);
                 if (st == 1) s.pocketedBalls++;
@@ -210,8 +213,7 @@ static GameState ReadGameState()
         }
     }
 
-    // Кий
-    uintptr_t vc = SafeRead<uintptr_t>(gm + 0x4D0);
+    // Кий — уже прочитан выше как vc
     if (IsPtr(vc)) {
         s.cueX = SafeRead<float>(vc + 0x18);
         s.cueY = SafeRead<float>(vc + 0x1C);
