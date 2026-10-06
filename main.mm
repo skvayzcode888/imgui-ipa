@@ -213,8 +213,10 @@ static GameState ReadGameState()
 //  Menu
 // ============================================================
 
-static bool g_showPockets = false;
-static bool g_demoWindow  = false;
+static bool      g_showPockets = false;
+static bool      g_demoWindow  = false;
+static GameState g_state       = {};
+static bool      g_stateOk     = false;
 static void DrawMenu()
 {
     ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
@@ -228,44 +230,33 @@ static void DrawMenu()
     if (g_showPockets) {
         ImGui::Spacing();
 
-        id gm = GetGameManager();
-        if (!gm) { ImGui::Text("GameManager: nil"); goto end_pk; }
-
-        {
-            id table = SafeCall(gm, "table");
-            if (!table) { ImGui::Text("table: nil"); goto end_pk; }
-
-            id tp = SafeCall(table, "tableProperties");
-            if (!tp) { ImGui::Text("tableProps: nil"); goto end_pk; }
-
-            // getPockets
-            double px[6]={}, py[6]={};
-            int cnt = ReadPockets(tp, px, py, 6);
-            ImGui::Text("pockets: %d", cnt);
-            for (int i = 0; i < cnt; i++)
-                ImGui::Text("  [%d] X=%.1f Y=%.1f", i, (float)px[i], (float)py[i]);
-
-            // balls + position
-            id ballsArr = SafeCall(table, "balls");
-            if (!ballsArr) { ImGui::Text("balls: nil"); goto end_pk; }
-            NSUInteger n = [ballsArr count];
-            ImGui::Text("balls: %d", (int)n);
-            int active=0, pocketed=0;
-            float cueX=0, cueY=0;
-            for (NSUInteger i = 0; i < n && i < 32; i++) {
-                id ball = [ballsArr objectAtIndex:i];
-                if (!ball) continue;
-                SEL ps = sel_registerName("position");
-                if (![ball respondsToSelector:ps]) continue;
-                CGPoint pos = ((CGPoint(*)(id,SEL))objc_msgSend)(ball, ps);
-                if (!isfinite(pos.x) || !isfinite(pos.y)) { pocketed++; continue; }
-                active++;
-                if (BallNumber(ball) == 0) { cueX=(float)pos.x; cueY=(float)pos.y; }
+        // Рисуем ТОЛЬКО из кеша — никаких вызовов игрового кода здесь
+        GameState &gs = g_state;
+        if (!g_stateOk || !gs.valid) {
+            ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Not in match");
+            if (g_stateOk) ImGui::Text("err: %s", gs.err);
+        } else {
+            ImGui::TextColored(ImVec4(0.4f,1,0.4f,1),
+                "Lunok: %d  r=%.2f", gs.pocketCount, gs.pocketRadius);
+            if (gs.nearestIdx >= 0) {
+                ImGui::TextColored(ImVec4(1,1,0.3f,1),
+                    "Blizh #%d  dist=%.1f", gs.nearestIdx, gs.nearestDist);
+                ImGui::Text("  X=%.2f  Y=%.2f",
+                    gs.pockets[gs.nearestIdx].x, gs.pockets[gs.nearestIdx].y);
             }
-            ImGui::Text("active=%d pocketed=%d", active, pocketed);
-            ImGui::Text("cue X=%.1f Y=%.1f", cueX, cueY);
+            ImGui::Separator();
+            for (int i = 0; i < gs.pocketCount; i++) {
+                bool near = (i == gs.nearestIdx);
+                if (near) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,0.3f,1));
+                ImGui::Text("[%d] X=%.1f  Y=%.1f%s",
+                    i, gs.pockets[i].x, gs.pockets[i].y, near ? " <--" : "");
+                if (near) ImGui::PopStyleColor();
+            }
+            ImGui::Separator();
+            ImGui::Text("Shary: %d  active=%d  zabito=%d",
+                gs.totalBalls, gs.activeBalls, gs.pocketedBalls);
+            ImGui::Text("Kiy:  X=%.1f  Y=%.1f", gs.cueX, gs.cueY);
         }
-        end_pk:;
     }
 
     ImGui::Separator();
@@ -337,6 +328,26 @@ static void DrawMenu()
     self.menuOpen = !self.menuOpen;
     _mtk.hidden   = !self.menuOpen;
     _mtk.paused   = !self.menuOpen;
+    if (self.menuOpen) {
+        // Первое обновление сразу
+        g_state   = ReadGameState();
+        g_stateOk = true;
+        // Периодическое обновление пока меню открыто
+        [self scheduleStateUpdate];
+    }
+}
+
+- (void)scheduleStateUpdate
+{
+    if (!self.menuOpen) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (self.menuOpen) {
+            g_state   = ReadGameState();
+            g_stateOk = true;
+            [self scheduleStateUpdate];
+        }
+    });
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)event
