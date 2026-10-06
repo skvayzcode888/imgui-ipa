@@ -228,12 +228,24 @@ static void DrawMenu()
     if (g_showPockets) {
         ImGui::Spacing();
 
-        // Шаг 1: только GetGameManager
         id gm = GetGameManager();
-        if (!gm)
-            ImGui::Text("GameManager: nil");
-        else
-            ImGui::Text("GameManager: OK 0x%llX", (unsigned long long)(__bridge void*)gm);
+        if (!gm) { ImGui::Text("GameManager: nil"); goto end_pk; }
+        ImGui::Text("GM: OK 0x%llX", (unsigned long long)(__bridge void*)gm);
+
+        {
+            id table = SafeCall(gm, "table");
+            if (!table) { ImGui::Text("table: nil"); goto end_pk; }
+            ImGui::Text("table: OK 0x%llX", (unsigned long long)(__bridge void*)table);
+
+            id tp = SafeCall(table, "tableProperties");
+            if (!tp) { ImGui::Text("tableProps: nil"); goto end_pk; }
+            ImGui::Text("tableProps: OK 0x%llX", (unsigned long long)(__bridge void*)tp);
+
+            id balls = SafeCall(table, "balls");
+            if (!balls) ImGui::Text("balls: nil");
+            else        ImGui::Text("balls: OK count=%d", (int)[balls count]);
+        }
+        end_pk:;
     }
 
     ImGui::Separator();
