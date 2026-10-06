@@ -123,18 +123,25 @@ static GameState ReadGameState()
             return s;
         }
 
-        // 3. Лунки — getPockets на table, возвращает C++ vector<CGPoint/double2>
+        // 3. tableProperties — именно на нём живут getPockets/getPocketRadius
+        id tableProps = SafeMsgSend(table, "tableProperties");
+        if (!tableProps) {
+            snprintf(s.err, sizeof(s.err), "table.tableProperties = nil");
+            return s;
+        }
+
+        // Лунки — getPockets на tableProperties
         double pxArr[6], pyArr[6];
-        int cnt = ReadVectorOfPoints(table, "getPockets", pxArr, pyArr, 6);
+        int cnt = ReadVectorOfPoints(tableProps, "getPockets", pxArr, pyArr, 6);
         if (cnt == 0)
-            cnt = ReadVectorOfPoints(table, "getPocketAimPoints", pxArr, pyArr, 6);
+            cnt = ReadVectorOfPoints(tableProps, "getPocketAimPoints", pxArr, pyArr, 6);
 
         s.pocketCount = cnt;
         for (int i = 0; i < cnt; i++)
             s.pockets[i] = { (float)pxArr[i], (float)pyArr[i], i };
 
-        // 4. Радиус лунки
-        s.pocketRadius = (float)SafeMsgSendDouble(table, "getPocketRadius");
+        // 4. Радиус лунки — тоже на tableProperties
+        s.pocketRadius = (float)SafeMsgSendDouble(tableProps, "getPocketRadius");
         if (s.pocketRadius < 0.01f) s.pocketRadius = 0.3f;
 
         // 5. Шары — [table balls]
