@@ -150,8 +150,7 @@ static GameState ReadGameState()
         id ballsObj = SafeMsgSend(table, "balls");
         if (ballsObj && [ballsObj respondsToSelector:@selector(count)]) {
             @try {
-                NSArray *balls = [(NSArray *)ballsObj copy];
-                s.totalBalls = (int)balls.count;
+                NSArray *balls = [(NSArray *)ballsObj copy];                s.totalBalls = (int)balls.count;
                 for (id ball in balls) {
                     @try {
                         if (![ball respondsToSelector:sel_registerName("position")]) {
@@ -183,7 +182,7 @@ static GameState ReadGameState()
                         } @catch (...) {}
                     } @catch (...) { s.activeBalls++; }
                 }
-                [balls release];
+                // ARC освобождает balls автоматически
             } @catch (...) {}
         }
 
@@ -220,7 +219,7 @@ static void DrawMenu()
 {
     ImGui::SetNextWindowSize(ImVec2(340, 400), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos (ImVec2(40,  60),  ImGuiCond_FirstUseEver);
-    ImGui::Begin("skvayz mod 8 ball pool | Beta.pw");
+    ImGui::Begin("crown.pw");
 
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
