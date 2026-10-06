@@ -19,14 +19,10 @@
 // ============================================================
 //  OFFSETS  (IDA Pro, pool 56.29.2, base 0x100000000)
 //
-//  AutoAim — статический объект (не pointer!), живёт в BSS:
-//    IDA addr  : 0x104ECB0
-//    file offset: 0x104ECB0 - 0x100000000 = 0x4ECB0
-//    runtime   : image_base + 0x4ECB0  <- это сам объект
-//
-//  AutoAim (объект):
-//    +0x78  -> GameManager*
-//    +0x88  -> GameManager* (fallback)
+//  GameManager — статический объект в BSS (не pointer!):
+//    IDA addr   : 0x104BC90
+//    file offset: 0x104BC90 - 0x100000000 = 0x4BC90
+//    runtime    : image_base + 0x4BC90  <- это сам объект
 //
 //  GameManager:
 //    +0x400 -> Table*
@@ -45,8 +41,7 @@
 //  VisualCue: +0x18 -> X,  +0x1C -> Y
 // ============================================================
 
-// Объект AutoAim живёт прямо по этому смещению в бинаре (не pointer!)
-static const uintptr_t kAutoAimFileOffset = 0x4ECB0;
+static const uintptr_t kGameMgrFileOffset = 0x4BC90; // IDA 0x104BC90 - 0x100000000
 
 // ============================================================
 //  BASE ADDRESS  (через mach_header, не vmaddr_slide)
@@ -135,29 +130,28 @@ static GameState ReadGameState()
         return s;
     }
 
-    // AutoAim — статический объект, живёт прямо по этому адресу
-    uintptr_t aa = base + kAutoAimFileOffset;
-    s.dbgAA = aa;
-    // Проверяем что адрес читаем (BSS должен быть замапан)
-    if (!IsPtr(aa)) {
-        snprintf(s.err, sizeof(s.err), "aa addr invalid: 0x%llX", (unsigned long long)aa);
-        return s;
-    }
-
-    // GameManager
-    uintptr_t gm = SafeRead<uintptr_t>(aa + 0x78);
-    if (!IsPtr(gm)) gm = SafeRead<uintptr_t>(aa + 0x88);
+    // GameManager — статический объект, живёт прямо по этому адресу
+    // IDA: unk_104BC90, file offset = 0x4BC90
+    uintptr_t gm = base + kGameMgrFileOffset;
+    s.dbgAA = gm;  // dbgAA теперь = GameManager addr для отображения
     s.dbgGM = gm;
     if (!IsPtr(gm)) {
-        snprintf(s.err, sizeof(s.err), "GameMgr=0");
+        snprintf(s.err, sizeof(s.err), "GM addr invalid: 0x%llX", (unsigned long long)gm);
         return s;
     }
 
-    // Table
+    // Проверяем что vtable читается — первые 8 байт должны быть указателем
+    uintptr_t vtbl = SafeRead<uintptr_t>(gm);
+    if (!IsPtr(vtbl)) {
+        snprintf(s.err, sizeof(s.err), "GM vtable=0, not initialized yet");
+        return s;
+    }
+
+    // Table* — читаем как pointer из GameManager+0x400
     uintptr_t tbl = SafeRead<uintptr_t>(gm + 0x400);
     s.dbgTbl = tbl;
     if (!IsPtr(tbl)) {
-        snprintf(s.err, sizeof(s.err), "Table=0");
+        snprintf(s.err, sizeof(s.err), "Table=0 (GM not in game yet?)");
         return s;
     }
 
@@ -264,9 +258,9 @@ static void DrawMenu()
             ImGui::Text("err: %s", gs.err);
             ImGui::Separator();
             ImGui::Text("base    0x%llX", (unsigned long long)gs.dbgBase);
-            ImGui::Text("autoAim 0x%llX", (unsigned long long)gs.dbgAA);
             ImGui::Text("gameMgr 0x%llX", (unsigned long long)gs.dbgGM);
             ImGui::Text("table   0x%llX", (unsigned long long)gs.dbgTbl);
+            ImGui::Text("vtable  0x%llX", (unsigned long long)SafeRead<uintptr_t>(gs.dbgGM));
             ImGui::Separator();
             // Все non-system образы для диагностики
             ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.3f, 1), "Images:");
