@@ -227,8 +227,13 @@ static void DrawMenu()
 
     if (g_showPockets) {
         ImGui::Spacing();
-        ImGui::Text("TEST: game state disabled");
-        // ReadGameState временно отключён для диагностики
+
+        // Шаг 1: только GetGameManager
+        id gm = GetGameManager();
+        if (!gm)
+            ImGui::Text("GameManager: nil");
+        else
+            ImGui::Text("GameManager: OK 0x%llX", (unsigned long long)(__bridge void*)gm);
     }
 
     ImGui::Separator();
