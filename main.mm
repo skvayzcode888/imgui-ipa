@@ -217,6 +217,9 @@ struct PocketInfo { float x, y; int idx; };
 
 struct BallScreenInfo { float worldX, worldY; ImU32 color; int number; };
 
+// forward declarations — определения ниже
+static ImVec2 WorldToScreen(float worldX, float worldY);
+static ImU32  BallColor(id ball);
 struct GameState {
     bool       valid;
     char       err[128];
