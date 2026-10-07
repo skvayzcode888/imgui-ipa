@@ -179,20 +179,17 @@ static bool ReadBoolIvar(id obj, ptrdiff_t off)
 static void SetCueBallTrajectory(bool enabled)
 {
     @try {
-        // 1. UserSettingsManager._showCueBallTrajectory @ +0x12
+        // 1. Устанавливаем флаг в UserSettingsManager
         id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
         WriteBoolIvar(usm, 0x12, enabled);
 
-        // 2. VisualGuide @ +0x36
+        // 2. Вызываем [gm setShowCueBallTrajectory] — он сам читает USM и обновляет VisualGuide
         id gm = GetGameManager();
-        if (!gm) return;
-        // gm->mVisualCue @ +0x4D0 — raw ptr (не ObjC retain)
-        uintptr_t vcuePtr = ReadRawPtr(gm, 0x4D0);
-        if (vcuePtr < 0x100000000ULL || vcuePtr > 0x7FFFFFFFFFFFULL) return;
-        uintptr_t vguidePtr = *(uintptr_t *)(vcuePtr + 0x3B8);
-        if (vguidePtr < 0x100000000ULL || vguidePtr > 0x7FFFFFFFFFFFULL) return;
-        // visualGuide @ +0x36 = bool
-        *(bool *)(vguidePtr + 0x36) = enabled;
+        if (gm) {
+            SEL s = sel_registerName("setShowCueBallTrajectory");
+            if ([gm respondsToSelector:s])
+                ((void(*)(id,SEL))objc_msgSend)(gm, s);
+        }
     } @catch (...) {}
 }
 
@@ -202,12 +199,12 @@ static void SetWideGuideline(bool enabled)
     @try {
         id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
         WriteBoolIvar(usm, 0x13, enabled);
-        // Обновляем через setShowCueBallTrajectory чтобы игра подхватила
-        id gm = GetGameManager();
-        if (gm) {
-            SEL s = sel_registerName("setShowCueBallTrajectory");
-            if ([gm respondsToSelector:s])
-                ((void(*)(id,SEL))objc_msgSend)(gm, s);
+
+        // [UserSettingsManager setWideGuideline:] применяет изменение
+        if (usm) {
+            SEL s = sel_registerName("setWideGuideline:");
+            if ([usm respondsToSelector:s])
+                ((void(*)(id,SEL,BOOL))objc_msgSend)(usm, s, enabled ? YES : NO);
         }
     } @catch (...) {}
 }
@@ -276,7 +273,13 @@ static GameState ReadGameState()
                     // position возвращает через sret (x8) — подтверждено дизасмом MyMenu+0x47DC
                     CGPoint pos = GetBallPosition(ball);
 
-                    if (!isfinite(pos.x) || !isfinite(pos.y)) {
+                    // Ball.state @ +0xA4: 0=active/inPlay, 2=pocketed, 4=hidden
+                    // Из -[Ball setState:]: state==2||state==4 -> hidden
+                    int ballState = 0;
+                    @try { ballState = *(int *)((uint8_t *)(__bridge void *)ball + 0xA4); }
+                    @catch (...) {}
+
+                    if (ballState >= 2) {
                         s.pocketedBalls++;
                         continue;
                     }
