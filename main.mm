@@ -31,71 +31,14 @@
 //  [ball position]                 -> CGPoint sret (x8)
 //
 // ============================================================
-//  Траектория — из бинаря игры (ivar offset'ы через _OBJC_IVAR_$):
+//  Траектория — ivar offset'ы из _OBJC_IVAR_$_ символов pool binary:
 //
 //  UserSettingsManager._showCueBallTrajectory  @ +0x12  (bool)
 //  UserSettingsManager._wideGuideline          @ +0x13  (bool)
 //  GameManager.mVisualCue                      @ +0x4D0 (VisualCue*)
-//  VisualCue.mVisualGuide                      @ +0x3B8 (VisualGuide*)
-//  VisualGuide flag showCueBallTrajectory       @ +0x36  (bool)
-//     → sub_100185E10: *(visualGuide + 0x36) = value
-//
-// Как включить траекторию (из -[GameManager setShowCueBallTrajectory]):
-//  1. *(UserSettingsManager + 0x12) = YES
-//  2. *(VisualGuide + 0x36) = YES
-// ============================================================
-
-// Читаем ivar из ObjC объекта по offset напрямую (безопасно — объект на куче)
-template<typename T>
-static T ReadIvar(id obj, ptrdiff_t off, T def = T{})
-{
-    if (!obj) return def;
-    @try { return *(T *)((uint8_t *)(__bridge void *)obj + off); }
-    @catch (...) { return def; }
-}
-
-template<typename T>
-static void WriteIvar(id obj, ptrdiff_t off, T val)
-{
-    if (!obj) return;
-    @try { *(T *)((uint8_t *)(__bridge void *)obj + off) = val; }
-    @catch (...) {}
-}
-
-// Включить/выключить траекторию кия через UserSettingsManager + VisualGuide
-static void SetCueBallTrajectory(bool enabled)
-{
-    @try {
-        // 1. UserSettingsManager._showCueBallTrajectory @ +0x12
-        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
-        if (usm) WriteIvar<bool>(usm, 0x12, enabled);
-
-        // 2. VisualGuide @ +0x36 (через GameManager -> mVisualCue -> mVisualGuide)
-        id gm = GetGameManager();
-        if (!gm) return;
-        id vcue = ReadIvar<id>(gm, 0x4D0);
-        if (!vcue || !IsPtr((uintptr_t)(__bridge void *)vcue)) return;
-        id vguide = ReadIvar<id>(vcue, 0x3B8);
-        if (!vguide || !IsPtr((uintptr_t)(__bridge void *)vguide)) return;
-        WriteIvar<bool>(vguide, 0x36, enabled);
-    } @catch (...) {}
-}
-
-// Включить/выключить широкий guideline
-static void SetWideGuideline(bool enabled)
-{
-    @try {
-        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
-        if (usm) WriteIvar<bool>(usm, 0x13, enabled);
-
-        // Применяем через -[GameManager setShowCueBallTrajectory] чтобы обновить VisualGuide
-        id gm = GetGameManager();
-        if (gm && [gm respondsToSelector:sel_registerName("setShowCueBallTrajectory")])
-            ((void(*)(id,SEL))objc_msgSend)(gm, sel_registerName("setShowCueBallTrajectory"));
-    } @catch (...) {}
-}
-//  ball.number                     -> int ivar    (class_getInstanceVariable)
-//  забитый шар: isfinite(pos.x)==false
+//  VisualCue.mVisualGuide                      @ +0x3B8 (ptr)
+//  VisualGuide.showCueBallTrajectory           @ +0x36  (bool)
+//     → -[GameManager setShowCueBallTrajectory]: *(visualGuide + 0x36) = value
 // ============================================================
 
 // SafeCall — обычный, без __unsafe_unretained
@@ -199,6 +142,75 @@ static id GetGameManager()
     SEL s = sel_registerName("sharedGameManager");
     if (![cls respondsToSelector:s]) return nil;
     return ((id(*)(id,SEL))objc_msgSend)((id)cls, s);
+}
+
+// ============================================================
+//  Траектория — через ivar offset'ы из бинаря игры
+// ============================================================
+
+// Читаем raw ptr из ivar объекта (не ObjC id — обходим ARC)
+static uintptr_t ReadRawPtr(id obj, ptrdiff_t off)
+{
+    if (!obj) return 0;
+    uintptr_t raw = 0;
+    @try { raw = *(uintptr_t *)((uint8_t *)(__bridge void *)obj + off); }
+    @catch (...) {}
+    return raw;
+}
+
+static void WriteBoolIvar(id obj, ptrdiff_t off, bool val)
+{
+    if (!obj) return;
+    @try { *(bool *)((uint8_t *)(__bridge void *)obj + off) = val; }
+    @catch (...) {}
+}
+
+static bool ReadBoolIvar(id obj, ptrdiff_t off)
+{
+    if (!obj) return false;
+    bool val = false;
+    @try { val = *(bool *)((uint8_t *)(__bridge void *)obj + off); }
+    @catch (...) {}
+    return val;
+}
+
+// Включаем/выключаем Cue Ball Trajectory
+// Источник: -[GameManager setShowCueBallTrajectory] в pool binary
+static void SetCueBallTrajectory(bool enabled)
+{
+    @try {
+        // 1. UserSettingsManager._showCueBallTrajectory @ +0x12
+        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
+        WriteBoolIvar(usm, 0x12, enabled);
+
+        // 2. VisualGuide @ +0x36
+        id gm = GetGameManager();
+        if (!gm) return;
+        // gm->mVisualCue @ +0x4D0 — raw ptr (не ObjC retain)
+        uintptr_t vcuePtr = ReadRawPtr(gm, 0x4D0);
+        if (!IsPtr(vcuePtr)) return;
+        // vcue->mVisualGuide @ +0x3B8
+        uintptr_t vguidePtr = *(uintptr_t *)(vcuePtr + 0x3B8);
+        if (!IsPtr(vguidePtr)) return;
+        // visualGuide @ +0x36 = bool
+        *(bool *)(vguidePtr + 0x36) = enabled;
+    } @catch (...) {}
+}
+
+// Включаем/выключаем Wide Guideline
+static void SetWideGuideline(bool enabled)
+{
+    @try {
+        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
+        WriteBoolIvar(usm, 0x13, enabled);
+        // Обновляем через setShowCueBallTrajectory чтобы игра подхватила
+        id gm = GetGameManager();
+        if (gm) {
+            SEL s = sel_registerName("setShowCueBallTrajectory");
+            if ([gm respondsToSelector:s])
+                ((void(*)(id,SEL))objc_msgSend)(gm, s);
+        }
+    } @catch (...) {}
 }
 
 // ============================================================
@@ -316,10 +328,9 @@ static void DrawMenu()
 
     // ---- Trajectory (из бинаря игры) ----
     {
-        // Читаем текущее состояние
         id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
-        bool traj    = usm ? ReadIvar<bool>(usm, 0x12) : false;
-        bool wide    = usm ? ReadIvar<bool>(usm, 0x13) : false;
+        bool traj = ReadBoolIvar(usm, 0x12);
+        bool wide = ReadBoolIvar(usm, 0x13);
 
         if (ImGui::Checkbox("Cue Ball Trajectory", &traj))
             SetCueBallTrajectory(traj);
