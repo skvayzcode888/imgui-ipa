@@ -215,6 +215,8 @@ static void SetWideGuideline(bool enabled)
 
 struct PocketInfo { float x, y; int idx; };
 
+struct BallScreenInfo { float worldX, worldY; ImU32 color; int number; };
+
 struct GameState {
     bool       valid;
     char       err[128];
@@ -225,6 +227,9 @@ struct GameState {
     float      pocketRadius;
     int        totalBalls, activeBalls, pocketedBalls;
     float      cueX, cueY;
+    // Позиции активных шаров для рисования линий
+    int           ballLineCount;
+    BallScreenInfo ballLines[16];
 };
 
 static GameState ReadGameState()
@@ -285,6 +290,15 @@ static GameState ReadGameState()
                     }
                     s.activeBalls++;
 
+                    // Сохраняем позицию для рисования линий
+                    if (s.ballLineCount < 16) {
+                        BallScreenInfo &bi = s.ballLines[s.ballLineCount++];
+                        bi.worldX  = (float)pos.x;
+                        bi.worldY  = (float)pos.y;
+                        bi.color   = BallColor(ball);
+                        bi.number  = BallNumber(ball);
+                    }
+
                     if (BallNumber(ball) == 0) {
                         s.cueX = (float)pos.x;
                         s.cueY = (float)pos.y;
@@ -315,8 +329,64 @@ static GameState ReadGameState()
 //  Menu
 // ============================================================
 
+// Конвертация мировых координат игры (Cocos2D) → пиксели экрана (ImGui)
+// Путь: worldPt -> [CCDirector convertToUI:] -> UIKit point -> ImVec2
+static ImVec2 WorldToScreen(float worldX, float worldY)
+{
+    @try {
+        id dir = SafeCall((id)objc_getClass("CCDirector"), "sharedDirector");
+        if (!dir) return ImVec2(-9999, -9999);
+
+        // convertToUI: принимает CGPoint (GLcoords) и возвращает UIKit point
+        // Наши координаты из getPockets/position уже в GL/world space Cocos2D
+        typedef CGPoint (*ConvFn)(id, SEL, CGPoint);
+        SEL sel = sel_registerName("convertToUI:");
+        if (![dir respondsToSelector:sel]) return ImVec2(-9999, -9999);
+
+        CGPoint wp = CGPointMake(worldX, worldY);
+        CGPoint sp = ((ConvFn)objc_msgSend)(dir, sel, wp);
+
+        // UIKit Y идёт сверху вниз, ImGui тоже — совпадает
+        // Учитываем scale экрана
+        float scale = (float)[UIScreen mainScreen].scale;
+        // ImGui работает в points, не pixels — scale не нужен
+        return ImVec2((float)sp.x, (float)sp.y);
+    } @catch (...) {
+        return ImVec2(-9999, -9999);
+    }
+}
+
+// Цвет шара по classification и number
+// classification: 0=cue, 1=solid, 2=striped, 3=eight
+static ImU32 BallColor(id ball)
+{
+    if (!ball) return IM_COL32(255,255,255,200);
+    int cls = 0, num = 0;
+    @try {
+        cls = *(int *)((uint8_t *)(__bridge void *)ball + 0xA0);
+        num = BallNumber(ball);
+    } @catch (...) {}
+
+    if (cls == 0) return IM_COL32(255, 255, 255, 220); // белый — cue
+    if (num == 8)  return IM_COL32(20,  20,  20,  220); // чёрный
+    if (cls == 2)  return IM_COL32(255, 160,  50, 220); // полосатый — оранжевый
+    // Solid: цвет по номеру
+    static const ImU32 solidColors[] = {
+        IM_COL32(255,230, 0,220), // 1 yellow
+        IM_COL32( 20, 80,220,220), // 2 blue
+        IM_COL32(220, 30, 30,220), // 3 red
+        IM_COL32(150,  0,150,220), // 4 purple
+        IM_COL32(220, 80,  0,220), // 5 orange
+        IM_COL32( 20,160, 20,220), // 6 green
+        IM_COL32(180, 20, 20,220), // 7 maroon
+    };
+    if (num >= 1 && num <= 7) return solidColors[num - 1];
+    return IM_COL32(200,200,200,200);
+}
+
 static bool      g_showPockets = false;
 static bool      g_demoWindow  = false;
+static bool      g_showLines   = false;  // линии от шаров к лункам
 static GameState g_state       = {};
 static bool      g_stateOk     = false;
 static void DrawMenu()
@@ -342,6 +412,7 @@ static void DrawMenu()
     }
 
     ImGui::Separator();
+    ImGui::Checkbox("Ball Lines to Pockets", &g_showLines);
     ImGui::Checkbox("Lunki / Shary", &g_showPockets);
 
     if (g_showPockets) {
@@ -382,6 +453,42 @@ static void DrawMenu()
     ImGui::End();
 
     if (g_demoWindow) ImGui::ShowDemoWindow(&g_demoWindow);
+
+    // ---- Fullscreen overlay: линии от шаров к лункам ----
+    if (g_showLines && g_stateOk && g_state.valid) {
+        ImGuiIO &io = ImGui::GetIO();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::SetNextWindowBgAlpha(0.0f);
+        ImGui::Begin("##overlay", nullptr,
+            ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_NoInputs     |
+            ImGuiWindowFlags_NoNav        |
+            ImGuiWindowFlags_NoMove       |
+            ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoSavedSettings);
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        GameState  &gs = g_state;
+
+        // Рисуем линии от каждого активного шара к каждой лунке
+        for (int b = 0; b < gs.ballLineCount; b++) {
+            BallScreenInfo &bi = gs.ballLines[b];
+            ImVec2 ballSc = WorldToScreen(bi.worldX, bi.worldY);
+            if (ballSc.x < -1000) continue;
+
+            for (int p = 0; p < gs.pocketCount; p++) {
+                ImVec2 pocketSc = WorldToScreen(gs.pockets[p].x, gs.pockets[p].y);
+                if (pocketSc.x < -1000) continue;
+
+                // Белый шар — линия к ближайшей лунке толще
+                float thick = (bi.number == 0 && p == gs.nearestIdx) ? 2.5f : 1.5f;
+                dl->AddLine(ballSc, pocketSc, bi.color, thick);
+            }
+        }
+
+        ImGui::End();
+    }
 }
 
 // ============================================================
