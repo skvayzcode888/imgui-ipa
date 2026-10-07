@@ -20,68 +20,80 @@
 #include <string.h>
 
 // ============================================================
-//  Проверено по дизасму poolLIB.dylib (game_loop_main_logic):
+//  Проверено по дизасму pool binary (pool 56.30.0):
 //
-//  [GameManager sharedGameManager] -> gm        (ObjC)
-//  [gm table]                      -> table      (ObjC)
-//  [table tableProperties]         -> tp         (ObjC)
-//  [tp getPockets]   -> C++ vector*: ptr[0]=begin, ptr[1]=end, ptr[2]=capacity
-//                       элемент = 16 байт (double x, double y)
-//  [tp getPocketRadius]            -> double      (sret через x8)
-//  [table balls]                   -> NSArray     (ObjC)
-//  [ball position]                 -> CGPoint     (sret через x8)
+//  [GameManager sharedGameManager] -> gm
+//  [gm table]                      -> table
+//  [table tableProperties]         -> tp
+//  [tp getPockets]                 -> C++ vector* sret
+//  [tp getPocketRadius]            -> double sret (x8)
+//  [table balls]                   -> NSArray
+//  [ball position]                 -> CGPoint sret (x8)
 //
 // ============================================================
-//  Флаги фич из poolLIB.dylib (подтверждено saveSettings):
+//  Траектория — из бинаря игры (ivar offset'ы через _OBJC_IVAR_$):
 //
-//  0x15878D  ShowTrajectory   — Enable Trajectory Overlay
-//  0x158808  ShowPrediction   — Cue Guideline
-//  0x15880A  ProjectedBalls   — Collision Trajectories
-//  0x15880B  ProjLines        — Projection Lines
-//  0x158810  AutoGame         — Shot Assist (авто-прицел)
+//  UserSettingsManager._showCueBallTrajectory  @ +0x12  (bool)
+//  UserSettingsManager._wideGuideline          @ +0x13  (bool)
+//  GameManager.mVisualCue                      @ +0x4D0 (VisualCue*)
+//  VisualCue.mVisualGuide                      @ +0x3B8 (VisualGuide*)
+//  VisualGuide flag showCueBallTrajectory       @ +0x36  (bool)
+//     → sub_100185E10: *(visualGuide + 0x36) = value
+//
+// Как включить траекторию (из -[GameManager setShowCueBallTrajectory]):
+//  1. *(UserSettingsManager + 0x12) = YES
+//  2. *(VisualGuide + 0x36) = YES
 // ============================================================
 
-// База poolLIB.dylib в памяти — ищем по имени
-static uintptr_t g_poolLibBase = 0;
-
-static uintptr_t GetPoolLibBase()
+// Читаем ivar из ObjC объекта по offset напрямую (безопасно — объект на куче)
+template<typename T>
+static T ReadIvar(id obj, ptrdiff_t off, T def = T{})
 {
-    if (g_poolLibBase) return g_poolLibBase;
-    uint32_t cnt = _dyld_image_count();
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *path = _dyld_get_image_name(i);
-        if (!path) continue;
-        const char *fname = strrchr(path, '/');
-        fname = fname ? fname + 1 : path;
-        if (strcmp(fname, "poolLIB.dylib") == 0) {
-            g_poolLibBase = (uintptr_t)_dyld_get_image_header(i);
-            return g_poolLibBase;
-        }
-    }
-    return 0;
+    if (!obj) return def;
+    @try { return *(T *)((uint8_t *)(__bridge void *)obj + off); }
+    @catch (...) { return def; }
 }
 
-// Читаем/пишем bool флаг в poolLIB по file offset
-static bool GetFlag(uintptr_t offset)
+template<typename T>
+static void WriteIvar(id obj, ptrdiff_t off, T val)
 {
-    uintptr_t base = GetPoolLibBase();
-    if (!base) return false;
-    return *(volatile bool *)(base + offset);
+    if (!obj) return;
+    @try { *(T *)((uint8_t *)(__bridge void *)obj + off) = val; }
+    @catch (...) {}
 }
 
-static void SetFlag(uintptr_t offset, bool val)
+// Включить/выключить траекторию кия через UserSettingsManager + VisualGuide
+static void SetCueBallTrajectory(bool enabled)
 {
-    uintptr_t base = GetPoolLibBase();
-    if (!base) return;
-    *(volatile bool *)(base + offset) = val;
+    @try {
+        // 1. UserSettingsManager._showCueBallTrajectory @ +0x12
+        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
+        if (usm) WriteIvar<bool>(usm, 0x12, enabled);
+
+        // 2. VisualGuide @ +0x36 (через GameManager -> mVisualCue -> mVisualGuide)
+        id gm = GetGameManager();
+        if (!gm) return;
+        id vcue = ReadIvar<id>(gm, 0x4D0);
+        if (!vcue || !IsPtr((uintptr_t)(__bridge void *)vcue)) return;
+        id vguide = ReadIvar<id>(vcue, 0x3B8);
+        if (!vguide || !IsPtr((uintptr_t)(__bridge void *)vguide)) return;
+        WriteIvar<bool>(vguide, 0x36, enabled);
+    } @catch (...) {}
 }
 
-// Офсеты флагов (из saveSettings poolLIB.dylib, imagebase=0)
-#define FLAG_TRAJECTORY  0x15878DUL   // ShowTrajectory
-#define FLAG_CUE_GUIDE   0x158808UL   // ShowPrediction (Cue Guideline)
-#define FLAG_COLLISION   0x15880AUL   // ProjectedBalls (Collision Trajectories)
-#define FLAG_PROJ_LINES  0x15880BUL   // ProjLines (Projection Lines)
-#define FLAG_AUTOGAME    0x158810UL   // AutoGame (Shot Assist)
+// Включить/выключить широкий guideline
+static void SetWideGuideline(bool enabled)
+{
+    @try {
+        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
+        if (usm) WriteIvar<bool>(usm, 0x13, enabled);
+
+        // Применяем через -[GameManager setShowCueBallTrajectory] чтобы обновить VisualGuide
+        id gm = GetGameManager();
+        if (gm && [gm respondsToSelector:sel_registerName("setShowCueBallTrajectory")])
+            ((void(*)(id,SEL))objc_msgSend)(gm, sel_registerName("setShowCueBallTrajectory"));
+    } @catch (...) {}
+}
 //  ball.number                     -> int ivar    (class_getInstanceVariable)
 //  забитый шар: isfinite(pos.x)==false
 // ============================================================
@@ -302,27 +314,18 @@ static void DrawMenu()
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
 
-    // ---- Trajectory ----
+    // ---- Trajectory (из бинаря игры) ----
     {
-        bool traj = GetFlag(FLAG_TRAJECTORY);
-        if (ImGui::Checkbox("Enable Trajectory Overlay", &traj))
-            SetFlag(FLAG_TRAJECTORY, traj);
+        // Читаем текущее состояние
+        id usm = SafeCall((id)objc_getClass("UserSettingsManager"), "sharedUserSettingsManager");
+        bool traj    = usm ? ReadIvar<bool>(usm, 0x12) : false;
+        bool wide    = usm ? ReadIvar<bool>(usm, 0x13) : false;
 
-        bool guide = GetFlag(FLAG_CUE_GUIDE);
-        if (ImGui::Checkbox("Cue Guideline", &guide))
-            SetFlag(FLAG_CUE_GUIDE, guide);
+        if (ImGui::Checkbox("Cue Ball Trajectory", &traj))
+            SetCueBallTrajectory(traj);
 
-        bool coll = GetFlag(FLAG_COLLISION);
-        if (ImGui::Checkbox("Collision Trajectory", &coll))
-            SetFlag(FLAG_COLLISION, coll);
-
-        bool proj = GetFlag(FLAG_PROJ_LINES);
-        if (ImGui::Checkbox("Projection Line", &proj))
-            SetFlag(FLAG_PROJ_LINES, proj);
-
-        bool autog = GetFlag(FLAG_AUTOGAME);
-        if (ImGui::Checkbox("Shot Assist (AutoGame)", &autog))
-            SetFlag(FLAG_AUTOGAME, autog);
+        if (ImGui::Checkbox("Wide Guideline", &wide))
+            SetWideGuideline(wide);
     }
 
     ImGui::Separator();
