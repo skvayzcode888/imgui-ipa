@@ -188,10 +188,9 @@ static void SetCueBallTrajectory(bool enabled)
         if (!gm) return;
         // gm->mVisualCue @ +0x4D0 — raw ptr (не ObjC retain)
         uintptr_t vcuePtr = ReadRawPtr(gm, 0x4D0);
-        if (!IsPtr(vcuePtr)) return;
-        // vcue->mVisualGuide @ +0x3B8
+        if (vcuePtr < 0x100000000ULL || vcuePtr > 0x7FFFFFFFFFFFULL) return;
         uintptr_t vguidePtr = *(uintptr_t *)(vcuePtr + 0x3B8);
-        if (!IsPtr(vguidePtr)) return;
+        if (vguidePtr < 0x100000000ULL || vguidePtr > 0x7FFFFFFFFFFFULL) return;
         // visualGuide @ +0x36 = bool
         *(bool *)(vguidePtr + 0x36) = enabled;
     } @catch (...) {}
