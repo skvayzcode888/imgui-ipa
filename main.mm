@@ -463,7 +463,7 @@ static ImVec2 BallToScreen(id ball)
 // Лунки — их координаты в физическом пространстве
 // Нужно перевести через тот же visualBall parent что и шары
 // Используем белый шар как референс для масштаба
-static id g_cueBallRef = nil; // обновляется в ReadGameState
+
 
 static ImVec2 PocketToScreen(float physX, float physY)
 {
