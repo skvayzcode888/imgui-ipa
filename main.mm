@@ -1,5 +1,6 @@
 // Dear ImGui (Metal) overlay — 8 Ball Pool mod
 // Open/close: 3-finger double-tap
+// ARC (-fobjc-arc), ARM64, C++17
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -19,18 +20,14 @@
 #include <string.h>
 #include <cmath>
 #include <vector>
+#include <algorithm>
+#include <initializer_list>
 #include <mach/mach.h>
 #include <libkern/OSCacheControl.h>
 
 // ============================================================
-//  Runtime патч: Infinite Guideline
-//
-//  pool binary sub_10010429C @ 0x100104534:
-//  STRB W8,  [SP,#0x104]  — записывает hideGuidelinesMode
-//  STRB WZR, [SP,#0x104]  — всегда 0 = guideline всегда показывается
-//
-//  Оригинальные байты: E8 13 04 39
-//  Патченные байты:    FF 13 04 39
+//  Runtime патч: Infinite Guideline (без изменений)
+//  Оригинальные байты: E8 13 04 39 -> Патч: FF 13 04 39
 // ============================================================
 
 static bool g_infiniteGuideline = false;
@@ -72,16 +69,21 @@ static void SetInfiniteGuideline(bool enable)
 }
 
 // ============================================================
-//  Coordinate conversion (алгоритм от Claude, проверен по poolLIB)
+//  Coordinate conversion
 //
-//  1. ball.visualBall — CCNode. Позиция в пространстве PARENT'а.
-//     world = [visualBall.parent convertToWorldSpace: visualBall.position]
-//  2. [CCDirector convertToUI: world] → UIKit points
-//  3. Конвертация через окно в overlay view
-//  4. Лунки/физика → affine fit по известным мячам
+//  ball.visualBall — CCNode, его _position лежит в пространстве PARENT'а:
+//     world = [parent convertToWorldSpace: visualBall._position]
+//     ui    = [CCDirector convertToUI: world]
+//     screen= GL-вью -> окно -> overlay
+//  Физика (позиции мячей/лузы) -> экран: affine (МНК) по мячам, у которых
+//  известны оба представления. Есть отбрасывание выбросов и диагностика.
 // ============================================================
 
 static __weak UIView *gOverlayView = nil;
+
+// ручная подстройка, если остаётся постоянный сдвиг (слайдеры в меню)
+static float g_offX = 0.f, g_offY = 0.f;
+static float g_fitTol = 10.f;          // допустимая RMS-ошибка фита, points
 
 static inline bool IsValidPt(CGPoint p) { return std::isfinite(p.x) && std::isfinite(p.y); }
 static const CGPoint kBadPt = { (CGFloat)NAN, (CGFloat)NAN };
@@ -123,84 +125,125 @@ static id CCDirectorShared() {
     return c ? Msg0((id)c, "sharedDirector") : nil;
 }
 
-static CGPoint UIToOverlay(id director, CGPoint ui) {
-    UIView *gl = nil;
+static UIView *GLViewOf(id director) {
+    if (!director) return nil;
     for (const char *n : { "openGLView", "view" }) {
         id v = Msg0(director, n);
-        if ([v isKindOfClass:[UIView class]]) { gl = (UIView *)v; break; }
+        if ([v isKindOfClass:[UIView class]]) return (UIView *)v;
     }
+    return nil;
+}
+
+// запасной вариант, если у CCDirector нет convertToUI: (cocos2d: y вниз)
+static CGPoint ManualToUI(id director, CGPoint w) {
+    UIView *gl = GLViewOf(director);
+    CGFloat h = gl ? gl.bounds.size.height : UIScreen.mainScreen.bounds.size.height;
+    return CGPointMake(w.x, h - w.y);
+}
+
+static CGPoint UIToOverlay(id director, CGPoint ui) {
+    UIView *gl = GLViewOf(director);
     if (!gl) return ui;
     CGPoint inWindow = [gl convertPoint:ui toView:nil];
     UIView *ov = gOverlayView;
     return ov ? [ov convertPoint:inWindow fromView:nil] : inWindow;
 }
 
-// referenceNode — нода, в локальном пространстве которой заданы x,y
-static CGPoint WorldToScreen(float x, float y, id referenceNode) {
-    if (!referenceNode) return kBadPt;
+// why: 0 ok, 1 нет visualBall, 2 нет parent/ноды, 3 нет position, 4 ошибка конвертации
+static CGPoint WorldToScreenEx(double x, double y, id referenceNode, int *why) {
+    int dummy; if (!why) why = &dummy;
+    *why = 0;
+    if (!referenceNode) { *why = 2; return kBadPt; }
     @try {
         id director = CCDirectorShared();
-        if (!director) return kBadPt;
+        if (!director) { *why = 4; return kBadPt; }
         SEL sWorld = sel_registerName("convertToWorldSpace:");
         SEL sUI    = sel_registerName("convertToUI:");
-        if (![referenceNode respondsToSelector:sWorld]) return kBadPt;
-        if (![director      respondsToSelector:sUI])   return kBadPt;
-        CGPoint world = MsgPt_Pt(referenceNode, sWorld, CGPointMake(x, y));
-        if (!IsValidPt(world)) return kBadPt;
-        CGPoint ui = MsgPt_Pt(director, sUI, world);
-        if (!IsValidPt(ui)) return kBadPt;
-        return UIToOverlay(director, ui);
-    } @catch (...) { return kBadPt; }
+        if (![referenceNode respondsToSelector:sWorld]) { *why = 4; return kBadPt; }
+        CGPoint world = MsgPt_Pt(referenceNode, sWorld, CGPointMake((CGFloat)x, (CGFloat)y));
+        if (!IsValidPt(world)) { *why = 4; return kBadPt; }
+        CGPoint ui = [director respondsToSelector:sUI] ? MsgPt_Pt(director, sUI, world)
+                                                       : ManualToUI(director, world);
+        if (!IsValidPt(ui)) { *why = 4; return kBadPt; }
+        CGPoint r = UIToOverlay(director, ui);
+        return CGPointMake(r.x + g_offX, r.y + g_offY);
+    } @catch (...) { *why = 4; return kBadPt; }
 }
 
 // Точная экранная позиция шара через visualBall CCNode
-static CGPoint BallToScreen(id ball) {
-    if (!ball) return kBadPt;
+static CGPoint BallToScreenEx(id ball, int *why) {
+    int dummy; if (!why) why = &dummy;
+    *why = 0;
+    if (!ball) { *why = 1; return kBadPt; }
     @try {
         id visual = GetIvarObject(ball, "visualBall");
-        if (!visual) return kBadPt;
+        if (!visual) { *why = 1; return kBadPt; }
         id parent = GetIvarObject(visual, "_parent");
         if (!parent) parent = Msg0(visual, "parent");
-        if (!parent) return kBadPt;
+        if (!parent) { *why = 2; return kBadPt; }
         CGPoint pos;
         if (!ReadIvarRaw(visual, "_position", &pos, sizeof(pos))) {
             SEL sp = sel_registerName("position");
-            if (![visual respondsToSelector:sp]) return kBadPt;
+            if (![visual respondsToSelector:sp]) { *why = 3; return kBadPt; }
             pos = MsgPt_0(visual, sp);
         }
-        if (!IsValidPt(pos)) return kBadPt;
-        return WorldToScreen((float)pos.x, (float)pos.y, parent);
-    } @catch (...) { return kBadPt; }
+        if (!IsValidPt(pos)) { *why = 3; return kBadPt; }
+        return WorldToScreenEx(pos.x, pos.y, parent, why);
+    } @catch (...) { *why = 4; return kBadPt; }
 }
 
-// Affine transform: физика → экран, подогнанная по мячам
+static CGPoint BallToScreen(id ball) { int w; return BallToScreenEx(ball, &w); }
+
+// ---- физическая позиция шара: -[Ball position] ----
+// Ты определил, что метод возвращает через x8 (sret). Буфер большой (64 байта) и
+// предзаполнен NaN: если метод на самом деле вернул CGPoint в d0/d1, буфер останется NaN —
+// тогда переключаемся на HFA-вызов (он безопасен только после такого вывода).
+struct SretBuf {
+    double v[8];
+    SretBuf() { for (int i = 0; i < 8; i++) v[i] = NAN; }
+    SretBuf(const SretBuf &o) { memcpy(v, o.v, sizeof(v)); }
+};
+
+static int g_posMode = -1;   // -1 неизвестно, 0 sret(x8), 1 HFA(d0/d1)
+
+static bool GetBallPhysPos(id ball, double *x, double *y) {
+    SEL s = sel_registerName("position");
+    if (![ball respondsToSelector:s]) return false;
+    if (g_posMode != 1) {
+        SretBuf r = ((SretBuf(*)(id,SEL))objc_msgSend)(ball, s);
+        if (std::isfinite(r.v[0]) && std::isfinite(r.v[1])) {
+            g_posMode = 0; *x = r.v[0]; *y = r.v[1]; return true;
+        }
+        if (g_posMode == 0) return false;
+    }
+    CGPoint p = MsgPt_0(ball, s);
+    if (!IsValidPt(p)) return false;
+    g_posMode = 1; *x = p.x; *y = p.y; return true;
+}
+
+// Шар в игре: state < 2 (0 active; 2 pocketed; 4 hidden) и onTable (если есть)
+static bool BallInPlay(id ball) {
+    if (!ball) return false;
+    int st = 0;
+    bool haveSt = ReadIvarRaw(ball, "state", &st, sizeof(st));
+    if (haveSt && st >= 2) return false;
+    SEL s = sel_registerName("onTable");
+    if ([ball respondsToSelector:s])
+        return ((BOOL(*)(id,SEL))objc_msgSend)(ball, s) ? true : false;
+    return haveSt;
+}
+
+// ---- affine физика -> экран ----
 struct Affine {
     double a=0,b=0,c=0,d=0,tx=0,ty=0;
-    bool valid=false;
+    bool have=false;    // фит посчитан
+    bool valid=false;   // и RMS в допуске
     CGPoint apply(double px, double py) const {
         return CGPointMake(a*px+b*py+tx, c*px+d*py+ty);
     }
 };
 
-// [Ball position] — sret через x8
-struct SretVec2 {
-    double x, y;
-    SretVec2(): x(0),y(0){}
-    SretVec2(const SretVec2 &o): x(o.x),y(o.y){}
-};
-
-static bool GetBallPhysPos(id ball, double *x, double *y) {
-    SEL s = sel_registerName("position");
-    if (![ball respondsToSelector:s]) return false;
-    SretVec2 v = ((SretVec2(*)(id,SEL))objc_msgSend)(ball, s);
-    if (!std::isfinite(v.x)||!std::isfinite(v.y)) return false;
-    *x=v.x; *y=v.y; return true;
-}
-
-static bool BallIsActive(id ball) {
-    int st = -1;
-    return ReadIvarRaw(ball, "state", &st, sizeof(st)) && st == 0;
-}
+struct Sample { double px, py, sx, sy; };
 
 static double Det3(const double m[3][3]) {
     return m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
@@ -209,47 +252,104 @@ static double Det3(const double m[3][3]) {
 }
 static bool Solve3(const double M[3][3], const double r[3], double out[3]) {
     double D = Det3(M);
-    if (std::fabs(D) < 1e-9) return false;
-    for (int c=0;c<3;++c) {
-        double T[3][3]; memcpy(T,M,sizeof(T));
-        for (int i=0;i<3;++i) T[i][c]=r[i];
-        out[c]=Det3(T)/D;
+    if (std::fabs(D) < 1e-12) return false;
+    for (int c = 0; c < 3; ++c) {
+        double T[3][3]; memcpy(T, M, sizeof(T));
+        for (int i = 0; i < 3; ++i) T[i][c] = r[i];
+        out[c] = Det3(T) / D;
     }
     return true;
 }
 
-static Affine CalibrateFromBalls(NSArray *balls) {
-    Affine T;
-    struct S { double px,py,sx,sy; };
-    std::vector<S> s;
-    for (id ball in balls) {
-        if (!BallIsActive(ball)) continue;
-        double px,py;
-        if (!GetBallPhysPos(ball,&px,&py)) continue;
-        CGPoint sc = BallToScreen(ball);
-        if (!IsValidPt(sc)) continue;
-        s.push_back({px,py,(double)sc.x,(double)sc.y});
-    }
-    if (s.size()<3) return T;
+static bool FitAffine(const std::vector<Sample> &s, Affine &T) {
+    if (s.size() < 3) return false;
     double Sxx=0,Sxy=0,Syy=0,Sx=0,Sy=0,N=(double)s.size();
-    double Rx[3]={0,0,0},Ry[3]={0,0,0};
-    for (auto &p:s) {
+    double Rx[3]={0,0,0}, Ry[3]={0,0,0};
+    for (auto &p : s) {
         Sxx+=p.px*p.px; Sxy+=p.px*p.py; Syy+=p.py*p.py;
         Sx+=p.px; Sy+=p.py;
         Rx[0]+=p.px*p.sx; Rx[1]+=p.py*p.sx; Rx[2]+=p.sx;
         Ry[0]+=p.px*p.sy; Ry[1]+=p.py*p.sy; Ry[2]+=p.sy;
     }
-    const double M[3][3]={{Sxx,Sxy,Sx},{Sxy,Syy,Sy},{Sx,Sy,N}};
-    double ox[3],oy[3];
-    if (!Solve3(M,Rx,ox)||!Solve3(M,Ry,oy)) return T;
+    const double M[3][3] = {{Sxx,Sxy,Sx},{Sxy,Syy,Sy},{Sx,Sy,N}};
+    double ox[3], oy[3];
+    if (!Solve3(M, Rx, ox) || !Solve3(M, Ry, oy)) return false;
     T.a=ox[0]; T.b=ox[1]; T.tx=ox[2];
     T.c=oy[0]; T.d=oy[1]; T.ty=oy[2];
-    double se=0;
-    for (auto &p:s) {
-        CGPoint q=T.apply(p.px,p.py);
-        se+=(q.x-p.sx)*(q.x-p.sx)+(q.y-p.sy)*(q.y-p.sy);
+    T.have = true;
+    return true;
+}
+
+static double Residual(const Affine &T, const Sample &p) {
+    CGPoint q = T.apply(p.px, p.py);
+    return std::sqrt((q.x-p.sx)*(q.x-p.sx) + (q.y-p.sy)*(q.y-p.sy));
+}
+static double RmsOf(const Affine &T, const std::vector<Sample> &s) {
+    double se = 0;
+    for (auto &p : s) { double r = Residual(T, p); se += r*r; }
+    return std::sqrt(se / (double)s.size());
+}
+
+// ---- диагностика фита (показывается в меню) ----
+struct FitInfo {
+    int ballsTotal=0, inPlay=0, samples=0, used=0;
+    int noPhys=0, failVisual=0, failParent=0, failPos=0, failConv=0;
+    double rms=-1;
+    double p0x=0,p0y=0,s0x=0,s0y=0;      // первый сэмпл: физика -> экран
+    double k0px=0,k0py=0,k0sx=0,k0sy=0;  // лунка 0: физика -> экран
+    double glW=0, glH=0;
+    int posMode=-1;
+};
+
+static Affine CalibrateFromBalls(NSArray *balls, FitInfo &fi) {
+    Affine T;
+    std::vector<Sample> s;
+    fi.ballsTotal = (int)[balls count];
+    for (id ball in balls) {
+        if (!BallInPlay(ball)) continue;
+        fi.inPlay++;
+        double px, py;
+        if (!GetBallPhysPos(ball, &px, &py)) { fi.noPhys++; continue; }
+        int why = 0;
+        CGPoint sc = BallToScreenEx(ball, &why);
+        if (!IsValidPt(sc)) {
+            if (why == 1) fi.failVisual++;
+            else if (why == 2) fi.failParent++;
+            else if (why == 3) fi.failPos++;
+            else fi.failConv++;
+            continue;
+        }
+        s.push_back({ px, py, (double)sc.x, (double)sc.y });
     }
-    T.valid = std::sqrt(se/N) < 8.0;
+    fi.samples = (int)s.size();
+    fi.posMode = g_posMode;
+    if (s.size() < 3) return T;
+    if (!FitAffine(s, T)) return T;
+
+    double rms = RmsOf(T, s);
+
+    // отбрасываем выбросы (шар в движении/интерполяция/ошибка чтения) и пересчитываем
+    if (rms > 2.0 && s.size() > 5) {
+        std::vector<double> res;
+        for (auto &p : s) res.push_back(Residual(T, p));
+        std::vector<double> sorted = res;
+        std::sort(sorted.begin(), sorted.end());
+        double med = sorted[sorted.size() / 2];
+        double lim = std::max(3.0 * med, 3.0);
+        std::vector<Sample> s2;
+        for (size_t i = 0; i < s.size(); i++) if (res[i] <= lim) s2.push_back(s[i]);
+        if (s2.size() >= 4 && s2.size() < s.size()) {
+            Affine T2;
+            if (FitAffine(s2, T2)) {
+                double r2 = RmsOf(T2, s2);
+                if (r2 < rms) { T = T2; rms = r2; s = s2; }
+            }
+        }
+    }
+    fi.used = (int)s.size();
+    fi.rms  = rms;
+    fi.p0x = s[0].px; fi.p0y = s[0].py; fi.s0x = s[0].sx; fi.s0y = s[0].sy;
+    T.valid = (rms < (double)g_fitTol);
     return T;
 }
 
@@ -322,6 +422,8 @@ static void SetWideGuideline(bool enabled) {
 
 // ============================================================
 //  Pocket reading
+//  getPockets возвращает УКАЗАТЕЛЬ на std::vector<{double x,y}> (x0), не sret.
+//  Читаем begin/end напрямую — ничего не аллоцируем и не течём.
 // ============================================================
 
 struct Vec2d { double x, y; };
@@ -351,7 +453,7 @@ static int ReadPockets(id tp, Vec2d *out, int maxN) {
 }
 
 // ============================================================
-//  Game state cache
+//  Game state (обновляется КАЖДЫЙ кадр, чтобы affine не отставал от камеры)
 // ============================================================
 
 struct GameState {
@@ -361,9 +463,9 @@ struct GameState {
     Vec2d pockets[6] = {};
     int   totalBalls=0, activeBalls=0, pocketedBalls=0;
     float cueX=0, cueY=0;
-    // для overlay
     NSArray *ballsArr = nil;
     Affine  affine = {};
+    FitInfo fit = {};
 };
 
 static GameState g_state   = {};
@@ -396,15 +498,20 @@ static GameState ReadGameState() {
                 s.activeBalls++;
                 if (BallNumber(ball)==0) {
                     double bx,by;
-                    if (GetBallPhysPos(ball,&bx,&by)) {
-                        s.cueX=(float)bx; s.cueY=(float)by;
-                    }
+                    if (GetBallPhysPos(ball,&bx,&by)) { s.cueX=(float)bx; s.cueY=(float)by; }
                 }
             }
         }
 
-        // Строим affine для лунок
-        if (ballsArr) s.affine = CalibrateFromBalls(ballsArr);
+        if (ballsArr) s.affine = CalibrateFromBalls(ballsArr, s.fit);
+
+        if (s.affine.have && s.pocketCount > 0) {
+            CGPoint k = s.affine.apply(s.pockets[0].x, s.pockets[0].y);
+            s.fit.k0px = s.pockets[0].x; s.fit.k0py = s.pockets[0].y;
+            s.fit.k0sx = k.x;            s.fit.k0sy = k.y;
+        }
+        UIView *gl = GLViewOf(CCDirectorShared());
+        if (gl) { s.fit.glW = gl.bounds.size.width; s.fit.glH = gl.bounds.size.height; }
 
         s.valid = true;
     } @catch(NSException *e) {
@@ -419,9 +526,10 @@ static GameState ReadGameState() {
 //  Menu
 // ============================================================
 
-static bool g_showPockets = false;
+static bool g_showPockets = true;
 static bool g_demoWindow  = false;
 static bool g_showLines   = false;
+static bool g_showDots    = false;
 
 static ImU32 BallColor(id ball) {
     if (!ball) return IM_COL32(255,255,255,200);
@@ -440,16 +548,15 @@ static ImU32 BallColor(id ball) {
     return IM_COL32(200,200,200,200);
 }
 
-static void DrawMenu()
+static void DrawMenuWindow()
 {
-    ImGui::SetNextWindowSize(ImVec2(340,420), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340,520), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos (ImVec2(40, 60),  ImGuiCond_FirstUseEver);
     ImGui::Begin("crown.pw");
 
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
 
-    // Trajectory
     {
         id usm = SafeCall((id)objc_getClass("UserSettingsManager"),"sharedUserSettingsManager");
         bool traj = ReadBoolIvar(usm,0x12);
@@ -459,27 +566,42 @@ static void DrawMenu()
     }
     ImGui::Separator();
 
-    // Infinite guideline patch
     if (ImGui::Checkbox("Infinite Guideline",&g_infiniteGuideline))
         SetInfiniteGuideline(g_infiniteGuideline);
     ImGui::Separator();
 
-    // Ball lines
     ImGui::Checkbox("Ball Lines to Pockets",&g_showLines);
+    ImGui::Checkbox("Debug dots (шары/лунки)",&g_showDots);
+    ImGui::SliderFloat("Offset X", &g_offX, -400.f, 400.f);
+    ImGui::SliderFloat("Offset Y", &g_offY, -400.f, 400.f);
+    ImGui::SliderFloat("Fit tol (pt)", &g_fitTol, 2.f, 40.f);
     ImGui::Separator();
 
-    // Debug info
-    ImGui::Checkbox("Lunki / Shary",&g_showPockets);
+    ImGui::Checkbox("Debug info",&g_showPockets);
     if (g_showPockets) {
-        GameState &gs=g_state;
-        if (!g_stateOk||!gs.valid) {
+        GameState &gs = g_state;
+        if (!g_stateOk || !gs.valid) {
             ImGui::TextColored(ImVec4(1,.3f,.3f,1),"Not in match");
             if (g_stateOk) ImGui::Text("err: %s",gs.err);
         } else {
-            ImGui::Text("Lunok: %d  Shary: %d/%d",
-                gs.pocketCount, gs.activeBalls, gs.totalBalls);
-            ImGui::Text("Affine: %s  (fit ok if green)",
-                gs.affine.valid?"OK":"FAIL");
+            const FitInfo &f = gs.fit;
+            ImGui::Text("Lunok: %d  Shary: %d/%d", gs.pocketCount, gs.activeBalls, gs.totalBalls);
+            ImGui::Text("inPlay %d  samples %d  used %d", f.inPlay, f.samples, f.used);
+            ImGui::Text("fail: phys %d vis %d par %d pos %d conv %d",
+                        f.noPhys, f.failVisual, f.failParent, f.failPos, f.failConv);
+            ImGui::Text("pos ABI: %s", f.posMode==0 ? "sret(x8)" : f.posMode==1 ? "HFA(d0/d1)" : "?");
+            if (f.rms >= 0) {
+                bool ok = gs.affine.valid;
+                ImGui::TextColored(ok ? ImVec4(.3f,1,.3f,1) : ImVec4(1,.3f,.3f,1),
+                                   "Affine: %s  RMS %.2f pt", ok ? "OK" : "FAIL", f.rms);
+            } else {
+                ImGui::TextColored(ImVec4(1,.3f,.3f,1), "Affine: FAIL (samples<3 / вырожден)");
+            }
+            ImGui::Text("ball0 phys(%.3f,%.3f)", f.p0x, f.p0y);
+            ImGui::Text("      -> scr(%.1f,%.1f)", f.s0x, f.s0y);
+            ImGui::Text("pocket0 phys(%.3f,%.3f)", f.k0px, f.k0py);
+            ImGui::Text("        -> scr(%.1f,%.1f)", f.k0sx, f.k0sy);
+            ImGui::Text("GL view %.0fx%.0f", f.glW, f.glH);
         }
     }
 
@@ -489,68 +611,62 @@ static void DrawMenu()
     ImGui::End();
 
     if (g_demoWindow) ImGui::ShowDemoWindow(&g_demoWindow);
+}
 
-    // ---- Overlay: линии шар → лунка ----
-    if (g_showLines && g_stateOk && g_state.valid && g_state.affine.valid) {
-        ImGuiIO &io = ImGui::GetIO();
-        ImGui::SetNextWindowPos(ImVec2(0,0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
-        ImGui::SetNextWindowBgAlpha(0.0f);
-        ImGui::Begin("##ov", nullptr,
-            ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|
-            ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoMove|
-            ImGuiWindowFlags_NoBringToFrontOnFocus|ImGuiWindowFlags_NoSavedSettings);
+// Линии шар -> ближайшая лунка. Рисуем в background draw list (работает и при закрытом меню).
+static void DrawBallLines()
+{
+    if (!(g_showLines || g_showDots)) return;
+    if (!g_stateOk || !g_state.valid || !g_state.affine.valid) return;
 
-        ImDrawList *dl = ImGui::GetWindowDrawList();
-        GameState  &gs = g_state;
+    GameState &gs = g_state;
+    ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-        // Конвертируем лунки через affine
-        CGPoint pocketSc[6];
-        for (int p=0; p<gs.pocketCount; p++)
-            pocketSc[p] = gs.affine.apply(gs.pockets[p].x, gs.pockets[p].y);
+    CGPoint pocketSc[6];
+    for (int p = 0; p < gs.pocketCount; p++)
+        pocketSc[p] = gs.affine.apply(gs.pockets[p].x, gs.pockets[p].y);
 
-        NSArray *balls = gs.ballsArr;
-        if (balls) {
-            for (id ball in balls) {
-                int st=0;
-                ReadIvarRaw(ball,"state",&st,sizeof(st));
-                if (st>=2) continue;
+    if (g_showDots)
+        for (int p = 0; p < gs.pocketCount; p++)
+            dl->AddCircle(ImVec2((float)pocketSc[p].x,(float)pocketSc[p].y),
+                          14.f, IM_COL32(50,255,50,230), 16, 2.f);
 
-                CGPoint ballSc = BallToScreen(ball);
-                if (!IsValidPt(ballSc)) continue;
+    NSArray *balls = gs.ballsArr;
+    if (!balls) return;
 
-                double bx,by;
-                if (!GetBallPhysPos(ball,&bx,&by)) continue;
+    for (id ball in balls) {
+        if (!BallInPlay(ball)) continue;
 
-                // Ближайшая лунка в физическом пространстве
-                float minD=1e9f; int nearP=-1;
-                for (int p=0; p<gs.pocketCount; p++) {
-                    float dx=(float)(gs.pockets[p].x-bx);
-                    float dy=(float)(gs.pockets[p].y-by);
-                    float d=sqrtf(dx*dx+dy*dy);
-                    if (d<minD) { minD=d; nearP=p; }
-                }
-                if (nearP<0) continue;
+        CGPoint ballSc = BallToScreen(ball);
+        if (!IsValidPt(ballSc)) continue;
 
-                CGPoint &psc = pocketSc[nearP];
-                if (!IsValidPt(psc)) continue;
+        if (g_showDots)
+            dl->AddCircle(ImVec2((float)ballSc.x,(float)ballSc.y),
+                          8.f, IM_COL32(255,60,60,230), 12, 2.f);
+        if (!g_showLines) continue;
 
-                ImU32 col = BallColor(ball);
-                int num = BallNumber(ball);
-                float thick = (num==0) ? 3.0f : 1.8f;
-                ImU32 colA = (col & 0x00FFFFFF) | 0xC0000000;
+        double bx, by;
+        if (!GetBallPhysPos(ball, &bx, &by)) continue;
 
-                dl->AddLine(
-                    ImVec2((float)ballSc.x,(float)ballSc.y),
-                    ImVec2((float)psc.x,   (float)psc.y),
-                    colA, thick);
-
-                // Кружок на лунке
-                dl->AddCircle(ImVec2((float)psc.x,(float)psc.y),
-                              10.f, IM_COL32(50,255,50,180), 12, 1.5f);
-            }
+        float minD = 1e30f; int nearP = -1;
+        for (int p = 0; p < gs.pocketCount; p++) {
+            float dx = (float)(gs.pockets[p].x - bx);
+            float dy = (float)(gs.pockets[p].y - by);
+            float d = dx*dx + dy*dy;
+            if (d < minD) { minD = d; nearP = p; }
         }
-        ImGui::End();
+        if (nearP < 0) continue;
+
+        CGPoint psc = pocketSc[nearP];
+        if (!IsValidPt(psc)) continue;
+
+        ImU32 col  = BallColor(ball);
+        ImU32 colA = (col & 0x00FFFFFF) | 0xC0000000;
+        float thick = (BallNumber(ball) == 0) ? 3.0f : 1.8f;
+
+        dl->AddLine(ImVec2((float)ballSc.x,(float)ballSc.y),
+                    ImVec2((float)psc.x,   (float)psc.y), colA, thick);
+        dl->AddCircle(ImVec2((float)psc.x,(float)psc.y), 10.f, IM_COL32(50,255,50,180), 12, 1.5f);
     }
 }
 
@@ -607,35 +723,23 @@ static void DrawMenu()
 
     ImGui_ImplMetal_Init(_device);
 
-    // Регистрируем overlay view для конвертации координат
-    gOverlayView = self;
+    gOverlayView = self;   // для конвертации координат
 
     return self;
+}
+
+// MTKView нужен, пока открыто меню ИЛИ включены линии
+- (void)refreshVisibility
+{
+    BOOL on = self.menuOpen || g_showLines || g_showDots;
+    if (_mtk.hidden == on)  _mtk.hidden = !on;
+    if (_mtk.paused == on)  _mtk.paused = !on;
 }
 
 - (void)toggleMenu
 {
     self.menuOpen = !self.menuOpen;
-    _mtk.hidden   = !self.menuOpen;
-    _mtk.paused   = !self.menuOpen;
-    if (self.menuOpen) {
-        g_state   = ReadGameState();
-        g_stateOk = true;
-        [self scheduleStateUpdate];
-    }
-}
-
-- (void)scheduleStateUpdate
-{
-    if (!self.menuOpen) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250*NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{
-        if (self.menuOpen) {
-            g_state   = ReadGameState();
-            g_stateOk = true;
-            [self scheduleStateUpdate];
-        }
-    });
+    [self refreshVisibility];
 }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)event
@@ -683,13 +787,20 @@ static void DrawMenu()
     if (io.DeltaTime<=0) io.DeltaTime=1.f/60.f;
     last=now;
 
+    // состояние игры + affine — каждый кадр (все на главном потоке, как и игра)
+    if (self.menuOpen || g_showLines || g_showDots) {
+        g_state   = ReadGameState();
+        g_stateOk = true;
+    }
+
     id<MTLCommandBuffer>     cb  = [self.queue commandBuffer];
     MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
     if (!rpd) { [cb commit]; return; }
 
     ImGui_ImplMetal_NewFrame(rpd);
     ImGui::NewFrame();
-    DrawMenu();
+    if (self.menuOpen) DrawMenuWindow();
+    DrawBallLines();
     ImGui::Render();
 
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
@@ -699,6 +810,8 @@ static void DrawMenu()
     [enc endEncoding];
     [cb presentDrawable:view.currentDrawable];
     [cb commit];
+
+    [self refreshVisibility];
 }
 @end
 
