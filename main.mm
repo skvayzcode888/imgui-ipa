@@ -215,7 +215,7 @@ static void SetWideGuideline(bool enabled)
 
 struct PocketInfo { float x, y; int idx; };
 
-struct BallScreenInfo { float worldX, worldY; ImU32 color; int number; };
+struct BallScreenInfo { float worldX, worldY; ImU32 color; int number; id ballObj; };
 
 // forward declarations — определения ниже
 static ImVec2 WorldToScreen(float worldX, float worldY);
@@ -300,6 +300,7 @@ static GameState ReadGameState()
                         bi.worldY  = (float)pos.y;
                         bi.color   = BallColor(ball);
                         bi.number  = BallNumber(ball);
+                        bi.ballObj = ball; // weak ref — не retain, игровой объект живёт пока игра идёт
                     }
 
                     if (BallNumber(ball) == 0) {
@@ -332,52 +333,99 @@ static GameState ReadGameState()
 //  Menu
 // ============================================================
 
-// Конвертация мировых координат игры (Cocos2D) → пиксели экрана (ImGui)
+// Конвертация мировых координат игры → пиксели экрана (ImGui)
 //
-// Алгоритм из sub_20A30 poolLIB:
-// [tableNode convertToWorldSpace: point] → абсолютные Cocos2D world coords
-// [CCDirector convertToUI: worldCoords] → UIKit points
+// Алгоритм из game_loop_main_logic poolLIB (адрес 0x17F00):
+// 1. ball.visualBall — CCNode (ivar +0x18 из pool binary)
+// 2. [visualBall convertToWorldSpace: [visualBall position]] → абсолютные Cocos2D coords
+// 3. [CCDirector convertToUI: worldCoords] → UIKit points = ImGui coords
 //
-// Координаты [ball position] и [getPockets] — это локальные coords Table node.
-// convertToWorldSpace переводит их в абсолютные, convertToUI — в экранные.
-static ImVec2 WorldToScreen(float worldX, float worldY)
+// Для лунок (TableProperties.getPockets) — координаты уже в пространстве Table,
+// нужно [table convertToWorldSpace: pocketPoint] → [CCDirector convertToUI:]
+
+static ImVec2 BallToScreen(id ball)
 {
+    if (!ball) return ImVec2(-9999, -9999);
     @try {
         typedef CGPoint (*ConvFn)(id, SEL, CGPoint);
 
-        // Шаг 1: Table node convertToWorldSpace
-        id gm = GetGameManager();
-        id tableNode = nil;
-        if (gm) {
-            id table = SafeCall(gm, "table");
-            if (table) {
-                // Пробуем получить CCNode layer
-                SEL layerSel = sel_registerName("layer");
-                if ([table respondsToSelector:layerSel])
-                    tableNode = ((id(*)(id,SEL))objc_msgSend)(table, layerSel);
-                if (!tableNode) tableNode = table;
-            }
-        }
+        // ball.visualBall @ +0x18 (из _OBJC_IVAR_$_Ball.visualBall в pool binary)
+        id visualBall = nil;
+        @try {
+            uintptr_t vbPtr = *(uintptr_t *)((uint8_t *)(__bridge void *)ball + 0x18);
+            if (vbPtr > 0x100000000ULL && vbPtr < 0x7FFFFFFFFFFFULL)
+                visualBall = (__bridge id)(void *)vbPtr;
+        } @catch (...) {}
 
-        CGPoint worldPt = CGPointMake(worldX, worldY);
+        if (!visualBall) return ImVec2(-9999, -9999);
 
-        if (tableNode) {
-            SEL c2wSel = sel_registerName("convertToWorldSpace:");
-            if ([tableNode respondsToSelector:c2wSel])
-                worldPt = ((ConvFn)objc_msgSend)(tableNode, c2wSel, CGPointMake(worldX, worldY));
-        }
+        // [visualBall position] → CGPoint в пространстве родителя
+        SEL posSel = sel_registerName("position");
+        if (![visualBall respondsToSelector:posSel]) return ImVec2(-9999, -9999);
+        CGPoint localPos = ((ConvFn)objc_msgSend)(visualBall, posSel, CGPointZero);
 
-        // Шаг 2: CCDirector convertToUI → UIKit points
+        // [visualBall convertToWorldSpace: localPos] → абсолютные Cocos2D coords
+        SEL c2wSel = sel_registerName("convertToWorldSpace:");
+        CGPoint worldPt = localPos;
+        if ([visualBall respondsToSelector:c2wSel])
+            worldPt = ((ConvFn)objc_msgSend)(visualBall, c2wSel, localPos);
+
+        // [CCDirector convertToUI: worldPt] → UIKit points
         id dir = SafeCall((id)objc_getClass("CCDirector"), "sharedDirector");
         if (!dir) return ImVec2(-9999, -9999);
         SEL convUI = sel_registerName("convertToUI:");
         if (![dir respondsToSelector:convUI]) return ImVec2(-9999, -9999);
         CGPoint uiPt = ((ConvFn)objc_msgSend)(dir, convUI, worldPt);
         return ImVec2((float)uiPt.x, (float)uiPt.y);
-
     } @catch (...) {
         return ImVec2(-9999, -9999);
     }
+}
+
+static ImVec2 PocketToScreen(float worldX, float worldY)
+{
+    @try {
+        typedef CGPoint (*ConvFn)(id, SEL, CGPoint);
+
+        // Лунки в пространстве Table → конвертируем через Table CCNode
+        id gm = GetGameManager();
+        id tableNode = nil;
+        if (gm) {
+            id table = SafeCall(gm, "table");
+            if (table) {
+                // Table сам является CCNode (наследник)
+                tableNode = table;
+                // Если есть layer — берём его (более точный CCNode)
+                SEL layerSel = sel_registerName("layer");
+                if ([table respondsToSelector:layerSel]) {
+                    id layer = ((id(*)(id,SEL))objc_msgSend)(table, layerSel);
+                    if (layer) tableNode = layer;
+                }
+            }
+        }
+
+        CGPoint worldPt = CGPointMake(worldX, worldY);
+        if (tableNode) {
+            SEL c2wSel = sel_registerName("convertToWorldSpace:");
+            if ([tableNode respondsToSelector:c2wSel])
+                worldPt = ((ConvFn)objc_msgSend)(tableNode, c2wSel, CGPointMake(worldX, worldY));
+        }
+
+        id dir = SafeCall((id)objc_getClass("CCDirector"), "sharedDirector");
+        if (!dir) return ImVec2(-9999, -9999);
+        SEL convUI = sel_registerName("convertToUI:");
+        if (![dir respondsToSelector:convUI]) return ImVec2(-9999, -9999);
+        CGPoint uiPt = ((ConvFn)objc_msgSend)(dir, convUI, worldPt);
+        return ImVec2((float)uiPt.x, (float)uiPt.y);
+    } @catch (...) {
+        return ImVec2(-9999, -9999);
+    }
+}
+
+// WorldToScreen — использует BallToScreen/PocketToScreen в зависимости от контекста
+static ImVec2 WorldToScreen(float worldX, float worldY)
+{
+    return PocketToScreen(worldX, worldY);
 }
 
 // Цвет шара по classification и number
@@ -417,7 +465,7 @@ static void DrawMenu()
 {
     ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos (ImVec2(40,  60),  ImGuiCond_FirstUseEver);
-    ImGui::Begin("crown.pw");
+    ImGui::Begin("crown.pw 11");
 
     ImGui::SliderFloat("UI scale", &ImGui::GetIO().FontGlobalScale, 0.6f, 2.5f);
     ImGui::Separator();
@@ -495,41 +543,39 @@ static void DrawMenu()
         ImDrawList *dl = ImGui::GetWindowDrawList();
         GameState  &gs = g_state;
 
-        // Рисуем линию от каждого шара к ближайшей к нему лунке
+        // Конвертируем лунки в экранные coords
+        ImVec2 pocketSc[6];
+        for (int p = 0; p < gs.pocketCount; p++)
+            pocketSc[p] = PocketToScreen(gs.pockets[p].x, gs.pockets[p].y);
+
+        // Рисуем по каждому активному шару из кеша
         for (int b = 0; b < gs.ballLineCount; b++) {
             BallScreenInfo &bi = gs.ballLines[b];
-            ImVec2 ballSc = WorldToScreen(bi.worldX, bi.worldY);
+            if (!bi.ballObj) continue;
+
+            ImVec2 ballSc = BallToScreen(bi.ballObj);
             if (ballSc.x < -1000) continue;
+
+            ImU32 col = bi.color;
+            int ballNum = bi.number;
 
             // Ищем ближайшую лунку к этому шару
             float minDist = 1e9f;
             int nearestP = -1;
             for (int p = 0; p < gs.pocketCount; p++) {
-                float dx = gs.pockets[p].x - bi.worldX;
-                float dy = gs.pockets[p].y - bi.worldY;
+                if (pocketSc[p].x < -1000) continue;
+                float dx = pocketSc[p].x - ballSc.x;
+                float dy = pocketSc[p].y - ballSc.y;
                 float d = sqrtf(dx*dx + dy*dy);
                 if (d < minDist) { minDist = d; nearestP = p; }
             }
-
             if (nearestP < 0) continue;
 
-            ImVec2 pocketSc = WorldToScreen(gs.pockets[nearestP].x, gs.pockets[nearestP].y);
-            if (pocketSc.x < -1000) continue;
-
-            // Удлиняем линию в 2 раза за лунку
-            float dx = pocketSc.x - ballSc.x;
-            float dy = pocketSc.y - ballSc.y;
-            ImVec2 extended = ImVec2(pocketSc.x + dx, pocketSc.y + dy);
-
-            // Белый шар — толще и ярче
-            float thick = (bi.number == 0) ? 3.0f : 2.0f;
-            // Делаем цвет полупрозрачным
-            ImU32 col = (bi.color & 0x00FFFFFF) | 0xB0000000; // alpha=0xB0
-
-            dl->AddLine(ballSc, extended, col, thick);
-
-            // Рисуем маленький кружок на месте лунки
-            dl->AddCircleFilled(pocketSc, 8.0f, IM_COL32(50, 255, 50, 150));
+            ImVec2 &psc = pocketSc[nearestP];
+            float thick = (ballNum == 0) ? 3.0f : 1.8f;
+            ImU32 colA = (col & 0x00FFFFFF) | 0xC0000000;
+            dl->AddLine(ballSc, psc, colA, thick);
+            dl->AddCircle(psc, 10.0f, IM_COL32(50,255,50,180), 12, 1.5f);
         }
 
         ImGui::End();
