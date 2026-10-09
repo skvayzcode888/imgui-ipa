@@ -220,6 +220,8 @@ struct BallScreenInfo { float worldX, worldY; ImU32 color; int number; id ballOb
 // forward declarations — определения ниже
 static ImVec2 WorldToScreen(float worldX, float worldY);
 static ImU32  BallColor(id ball);
+static void   UpdateScreenParams();
+static id     g_cueBallRef = nil;
 struct GameState {
     bool       valid;
     char       err[128];
