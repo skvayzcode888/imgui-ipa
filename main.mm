@@ -18,6 +18,84 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <mach/mach.h>
+#include <sys/mman.h>
+
+// ============================================================
+//  Runtime патч: Infinite Guideline
+//
+//  pool binary, sub_10010429C @ 0x100104534:
+//  STRB W8, [SP,#0x104]  — записывает hideGuidelinesMode (0 или 1)
+//  Патч: STRB WZR, [SP,#0x104] — всегда 0 = guideline всегда показывается
+//
+//  Оригинальные байты: E8 13 04 39
+//  Патченные байты:    FF 13 04 39
+//
+//  Проверено через IDA:
+//  - sub_1001856FC: читает guidelineRange из конфига, возвращает true если
+//    шар вне диапазона → скрывает guideline
+//  - sub_10010429C: вычисляет hideGuidelinesMode = rangeCheck & tierBitmask
+//  - Наш патч принудительно делает hideGuidelinesMode = 0 всегда
+// ============================================================
+
+static bool g_infiniteGuideline = false;
+
+static bool PatchMemory(uintptr_t addr, const uint8_t *newBytes, size_t len)
+{
+    // Выравниваем на страницу
+    uintptr_t page     = addr & ~(uintptr_t)(PAGE_SIZE - 1);
+    size_t    pageLen  = ((addr + len - page) + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+
+    // Снимаем защиту
+    kern_return_t kr = vm_protect(mach_task_self(), page, pageLen,
+                                   false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) return false;
+
+    memcpy((void *)addr, newBytes, len);
+
+    // Восстанавливаем защиту
+    vm_protect(mach_task_self(), page, pageLen,
+               false, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    // Сбрасываем i-cache
+    __builtin___clear_cache((char *)addr, (char *)(addr + len));
+    return true;
+}
+
+// Получаем ASLR slide для pool binary (main executable)
+static uintptr_t GetPoolSlide()
+{
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        const char *base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+        if (strcmp(base, "pool") == 0)
+            return (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+    }
+    // Фолбэк: главный образ
+    return (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+}
+
+static void SetInfiniteGuideline(bool enable)
+{
+    uintptr_t slide = GetPoolSlide();
+
+    // Адрес STRB инструкции в pool binary (file offset = VA - 0x100000000)
+    // VA = 0x100104534, fileoff = 0x104534
+    uintptr_t patchAddr = slide + 0x100104534ULL;
+
+    static const uint8_t origBytes[]  = { 0xE8, 0x13, 0x04, 0x39 }; // STRB W8,  [SP,#0x104]
+    static const uint8_t patchBytes[] = { 0xFF, 0x13, 0x04, 0x39 }; // STRB WZR, [SP,#0x104]
+
+    if (enable)
+        PatchMemory(patchAddr, patchBytes, 4);
+    else
+        PatchMemory(patchAddr, origBytes, 4);
+
+    g_infiniteGuideline = enable;
+}
 
 // ============================================================
 //  Проверено по дизасму pool binary (pool 56.30.0):
@@ -542,6 +620,11 @@ static void DrawMenu()
 
     ImGui::Separator();
     ImGui::Checkbox("Ball Lines to Pockets", &g_showLines);
+    ImGui::Separator();
+
+    // ---- Infinite Guideline (runtime патч) ----
+    if (ImGui::Checkbox("Infinite Guideline", &g_infiniteGuideline))
+        SetInfiniteGuideline(g_infiniteGuideline);
     ImGui::Checkbox("Lunki / Shary", &g_showPockets);
 
     if (g_showPockets) {
