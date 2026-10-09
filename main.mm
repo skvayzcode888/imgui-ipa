@@ -20,6 +20,7 @@
 #include <string.h>
 #include <mach/mach.h>
 #include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 
 // ============================================================
 //  Runtime патч: Infinite Guideline
@@ -58,7 +59,7 @@ static bool PatchMemory(uintptr_t addr, const uint8_t *newBytes, size_t len)
                false, VM_PROT_READ | VM_PROT_EXECUTE);
 
     // Сбрасываем i-cache
-    __builtin___clear_cache((char *)addr, (char *)(addr + len));
+    sys_icache_invalidate((void *)addr, len);
     return true;
 }
 
